@@ -84,7 +84,7 @@ def compute_peripheral_indicator(predictions_df: pd.DataFrame) -> Optional[Dict[
     This is purely descriptive — no impact on risk logic.
     
     Args:
-        predictions_df: Prediction DataFrame with 'ward_id', 'risk' columns
+        predictions_df: Prediction DataFrame with 'ward_id', 'risk_level' columns
                        and optionally 'is_peripheral_ward' column
     
     Returns:
@@ -98,10 +98,10 @@ def compute_peripheral_indicator(predictions_df: pd.DataFrame) -> Optional[Dict[
     if predictions_df is None or len(predictions_df) == 0:
         return None
     
-    if 'risk' not in predictions_df.columns:
+    if 'risk_level' not in predictions_df.columns:
         return None
     
-    high_risk = predictions_df[predictions_df['risk'] == 'High']
+    high_risk = predictions_df[predictions_df['risk_level'] == 'High']
     high_risk_count = len(high_risk)
     
     if high_risk_count == 0:
@@ -149,11 +149,11 @@ def compute_infection_influence_arrows(
     Influence_i→j = P_i if j ∈ N(i)
     
     Only draws arrows for wards where:
-    - risk == "High"
+    - risk_level == "High"
     - is_peripheral == 1
     
     Args:
-        predictions_df: Prediction DataFrame with 'ward_id', 'risk', 'probability'
+        predictions_df: Prediction DataFrame with 'ward_id', 'risk_level', 'probability'
         threshold: Risk threshold for "High" classification
     
     Returns:
@@ -181,7 +181,7 @@ def compute_infection_influence_arrows(
         return []
     
     # Find high-risk peripheral wards
-    high_risk = predictions_df[predictions_df['risk'] == 'High'].copy()
+    high_risk = predictions_df[predictions_df['risk_level'] == 'High'].copy()
     
     if len(high_risk) == 0:
         return []
@@ -253,7 +253,7 @@ def compute_neighbor_risk_overlay(
     
     # Build probability lookup
     prob_lookup = dict(zip(predictions_df['ward_id'], predictions_df['probability']))
-    risk_lookup = dict(zip(predictions_df['ward_id'], predictions_df.get('risk', ['Low'] * len(predictions_df))))
+    risk_lookup = dict(zip(predictions_df['ward_id'], predictions_df.get('risk_level', ['Low'] * len(predictions_df))))
     
     result = {}
     
@@ -347,14 +347,14 @@ def simulate_spatial_spread(
         Values capped at 1.0
     
     Args:
-        pred_df: Original prediction DataFrame with 'ward_id', 'probability', 'risk'
+        pred_df: Original prediction DataFrame with 'ward_id', 'probability', 'risk_level'
         threshold: Risk threshold (for recomputing simulated risk class)
         alpha: Diffusion coefficient (0.10 to 0.15 recommended)
     
     Returns:
         Simulated DataFrame with additional columns:
             - simulated_probability: adjusted probability
-            - simulated_risk: recomputed risk class based on simulation
+            - simulated_risk_level: recomputed risk class based on simulation
             - spread_source: list of source wards that influenced this ward
         Returns None if data insufficient
     """
@@ -382,7 +382,7 @@ def simulate_spatial_spread(
     
     # Identify high-risk peripheral wards (sources of spread)
     high_risk_peripheral = sim_df[
-        (sim_df['risk'] == 'High') & 
+        (sim_df['risk_level'] == 'High') & 
         (sim_df['ward_id'].isin(peripheral_wards))
     ]
     
@@ -410,7 +410,7 @@ def simulate_spatial_spread(
     sim_df['simulated_probability'] = sim_df['simulated_probability'].clip(upper=1.0)
     
     # Compute simulated risk class (for visualization only)
-    # This does NOT replace the original 'risk' column
+    # This does NOT replace the original 'risk_level' column
     def classify_simulated_risk(prob, thresh):
         if prob >= thresh:
             return 'High'
@@ -418,7 +418,7 @@ def simulate_spatial_spread(
             return 'Moderate'
         return 'Low'
     
-    sim_df['simulated_risk'] = sim_df['simulated_probability'].apply(
+    sim_df['simulated_risk_level'] = sim_df['simulated_probability'].apply(
         lambda p: classify_simulated_risk(p, threshold)
     )
     
@@ -442,8 +442,8 @@ def get_spread_simulation_summary(sim_df: pd.DataFrame) -> Dict[str, Any]:
     
     affected_wards = sim_df[sim_df['spread_delta'] > 0.001]
     new_high_risk = sim_df[
-        (sim_df['simulated_risk'] == 'High') & 
-        (sim_df['risk'] != 'High')
+        (sim_df['simulated_risk_level'] == 'High') & 
+        (sim_df['risk_level'] != 'High')
     ]
     
     return {

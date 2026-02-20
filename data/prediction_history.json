@@ -4,5 +4,11 @@
     "high_risk_wards": 0,
     "alert_load_pct": 0.0,
     "alert_status": "Normal"
+  },
+  {
+    "date": "2026-02-21",
+    "high_risk_wards": 0,
+    "alert_load_pct": 0.0,
+    "alert_status": "Normal"
   }
 ]

@@ -172,6 +172,8 @@ def add_static_spatial_features(df: pd.DataFrame) -> pd.DataFrame:
     
     Features added (when data available):
     - is_peripheral_ward (0/1): Whether ward touches district boundary
+    - distance_from_city_center (float): Distance of ward centroid from city centroid
+    - ring_road_exposure_score (float): Proximity proxy (inverse normalized distance)
     
     Args:
         df: DataFrame with ward-level data (must have 'ward_id' column).
@@ -193,6 +195,36 @@ def add_static_spatial_features(df: pd.DataFrame) -> pd.DataFrame:
             lambda w: 1 if str(w) in peripheral_set else 0
         )
         logger.info("Added is_peripheral_ward feature")
+
+    # ===== CENTROID-BASED STATIC FEATURES =====
+    centroids = load_spatial_centroids()
+    if centroids:
+        centroid_df = pd.DataFrame.from_dict(centroids, orient='index')
+        if {'lat', 'lon'}.issubset(set(centroid_df.columns)):
+            city_lat = float(centroid_df['lat'].mean())
+            city_lon = float(centroid_df['lon'].mean())
+
+            ward_distance_map = {}
+            for ward_id, coords in centroids.items():
+                lat = float(coords.get('lat', np.nan))
+                lon = float(coords.get('lon', np.nan))
+                if np.isnan(lat) or np.isnan(lon):
+                    continue
+                ward_distance_map[str(ward_id)] = float(np.sqrt((lat - city_lat) ** 2 + (lon - city_lon) ** 2))
+
+            if ward_distance_map:
+                max_distance = max(ward_distance_map.values())
+                if max_distance > 0:
+                    ring_road_map = {
+                        ward_id: float(1.0 - (distance / max_distance))
+                        for ward_id, distance in ward_distance_map.items()
+                    }
+                else:
+                    ring_road_map = {ward_id: 1.0 for ward_id in ward_distance_map.keys()}
+
+                data['distance_from_city_center'] = data[WARD_ID_COL].astype(str).map(ward_distance_map)
+                data['ring_road_exposure_score'] = data[WARD_ID_COL].astype(str).map(ring_road_map)
+                logger.info("Added centroid-based static spatial features")
     
     return data
 
@@ -207,6 +239,8 @@ def add_neighbor_lag_features(
     Computes average of neighbors' T-1 values (no leakage):
     - neighbor_avg_cases_last_week
     - neighbor_outbreak_rate_last_week
+    - neighbor_avg_ecoli_last_week
+    - neighbor_rainfall_avg_last_week
     
     Args:
         df: DataFrame with ward-level features (must have lag columns already).
@@ -237,18 +271,29 @@ def add_neighbor_lag_features(
     if TARGET_COL in data.columns and 'outbreak_last_week' not in data.columns:
         data['outbreak_last_week'] = grouped[TARGET_COL].shift(1)
     
+    # Additional lag columns for backward-compatible spatial schema
+    if 'ecoli_last_week' not in data.columns:
+        data['ecoli_last_week'] = grouped[ECOLI_COL].shift(1)
+    if 'rainfall_last_week' not in data.columns:
+        data['rainfall_last_week'] = grouped[RAINFALL_COL].shift(1)
+
     # Build lookup: (ward_id, week_start_date) -> lag values
-    lag_lookup_cols = ['cases_last_week']
+    lag_lookup_cols = ['cases_last_week', 'ecoli_last_week', 'rainfall_last_week']
     if 'outbreak_last_week' in data.columns:
         lag_lookup_cols.append('outbreak_last_week')
     
-    # Create indexed lookup for fast neighbor queries
+    # Create dictionary lookup for fast neighbor queries
     lookup_df = data[[WARD_ID_COL, WEEK_START_DATE_COL] + lag_lookup_cols].copy()
-    lookup_df = lookup_df.set_index([WARD_ID_COL, WEEK_START_DATE_COL])
+    lookup_map = {
+        (str(row[WARD_ID_COL]), row[WEEK_START_DATE_COL]): row
+        for _, row in lookup_df.iterrows()
+    }
     
-    # Initialize neighbor feature columns (exactly 2)
+    # Initialize neighbor feature columns
     data['neighbor_avg_cases_last_week'] = np.nan
     data['neighbor_outbreak_rate_last_week'] = np.nan
+    data['neighbor_avg_ecoli_last_week'] = np.nan
+    data['neighbor_rainfall_avg_last_week'] = np.nan
     
     # Get unique weeks for batch processing
     unique_weeks = data[WEEK_START_DATE_COL].unique()
@@ -269,24 +314,32 @@ def add_neighbor_lag_features(
             # Collect neighbor lag-1 values for this week
             neighbor_cases = []
             neighbor_outbreak = []
+            neighbor_ecoli = []
+            neighbor_rainfall = []
             
             for neighbor_id in neighbors:
-                try:
-                    neighbor_data = lookup_df.loc[(str(neighbor_id), week)]
-                    
-                    if pd.notna(neighbor_data['cases_last_week']):
-                        neighbor_cases.append(neighbor_data['cases_last_week'])
-                    if 'outbreak_last_week' in neighbor_data.index and pd.notna(neighbor_data['outbreak_last_week']):
-                        neighbor_outbreak.append(neighbor_data['outbreak_last_week'])
-                except KeyError:
-                    # Neighbor not found for this week - skip
+                neighbor_data = lookup_map.get((str(neighbor_id), week))
+                if neighbor_data is None:
                     continue
+
+                if pd.notna(neighbor_data['cases_last_week']):
+                    neighbor_cases.append(neighbor_data['cases_last_week'])
+                if pd.notna(neighbor_data['ecoli_last_week']):
+                    neighbor_ecoli.append(neighbor_data['ecoli_last_week'])
+                if pd.notna(neighbor_data['rainfall_last_week']):
+                    neighbor_rainfall.append(neighbor_data['rainfall_last_week'])
+                if 'outbreak_last_week' in neighbor_data.index and pd.notna(neighbor_data['outbreak_last_week']):
+                    neighbor_outbreak.append(neighbor_data['outbreak_last_week'])
             
             # Compute averages (mean of neighbors' t-1 values)
             if neighbor_cases:
                 data.loc[idx, 'neighbor_avg_cases_last_week'] = np.mean(neighbor_cases)
             if neighbor_outbreak:
                 data.loc[idx, 'neighbor_outbreak_rate_last_week'] = np.mean(neighbor_outbreak)
+            if neighbor_ecoli:
+                data.loc[idx, 'neighbor_avg_ecoli_last_week'] = np.mean(neighbor_ecoli)
+            if neighbor_rainfall:
+                data.loc[idx, 'neighbor_rainfall_avg_last_week'] = np.mean(neighbor_rainfall)
     
     return data
 
@@ -432,6 +485,31 @@ def engineer_outbreak_features(
     # Add peripheral ward flag and distance-based features
     data = add_static_spatial_features(data)
 
+    # ===== SPATIAL FEATURE INTEGRITY GATE =====
+    # Spatial features must be all-or-none to avoid partial schema states.
+    required_spatial_columns = get_spatial_feature_columns()
+    present_spatial_columns = [column for column in required_spatial_columns if column in data.columns]
+
+    if len(present_spatial_columns) == len(required_spatial_columns):
+        logger.info(
+            "Spatial features enabled: %s",
+            ", ".join(required_spatial_columns),
+        )
+    elif len(present_spatial_columns) == 0:
+        logger.warning(
+            "Spatial features disabled: required spatial metadata missing or unavailable. "
+            "Continuing without spatial features."
+        )
+    else:
+        logger.warning(
+            "Partial spatial feature state detected (present=%s, required=%s). "
+            "Disabling spatial features for this run.",
+            present_spatial_columns,
+            required_spatial_columns,
+        )
+        data = data.drop(columns=present_spatial_columns, errors='ignore')
+        logger.warning("Spatial features disabled: continuing without spatial features.")
+
     if dropna_lag_rows:
         required_lag_cols = [
             'cases_last_week',
@@ -461,12 +539,16 @@ def get_spatial_feature_columns() -> list:
     """Return spatial feature columns for experimental training.
     
     These are optionally included when include_spatial_features=True.
-    Returns 2 lagged neighbor features + 1 static peripheral flag.
+    Returns backward-compatible spatial features expected by legacy artifacts.
     """
     return [
         'neighbor_avg_cases_last_week',
         'neighbor_outbreak_rate_last_week',
+        'neighbor_avg_ecoli_last_week',
+        'neighbor_rainfall_avg_last_week',
         'is_peripheral_ward',
+        'distance_from_city_center',
+        'ring_road_exposure_score',
     ]
 
 

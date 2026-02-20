@@ -58,7 +58,7 @@ def aggregate_predictions_to_zones(predictions_df, threshold=0.5):
     
     # Apply risk classification to zone average
     from .risk_logic import classify_risk
-    zone_agg['risk'] = zone_agg['avg_probability'].apply(lambda probability: classify_risk(probability, threshold=threshold))
+    zone_agg['risk_level'] = zone_agg['avg_probability'].apply(lambda probability: classify_risk(probability, threshold=threshold))
     
     return zone_agg
 
@@ -73,7 +73,7 @@ def get_high_risk_wards_by_zone(predictions_df):
     Returns:
         dict: Zone -> list of high-risk wards
     """
-    high_risk = predictions_df[predictions_df['risk'] == 'High'].copy()
+    high_risk = predictions_df[predictions_df['risk_level'] == 'High'].copy()
     high_risk['zone'] = high_risk['ward_id'].apply(map_ward_to_zone)
     
     zone_dict = {}

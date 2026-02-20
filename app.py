@@ -70,57 +70,72 @@ st.markdown("""
 # =============================================================================
 
 def resolve_default_data_path():
-    """Resolve best operational data source with integrated dataset priority."""
-    config = load_runtime_config()
-    data_dir = os.path.join(os.path.dirname(__file__), 'data')
-    preferred = [
-        'data/integrated_surveillance_dataset_final.csv',
-        'data/integrated_surveillance_dataset.csv',
-        config.get('data_path', 'data/coimbatore_unified_master_dataset_with_zone.csv'),
-        'data/coimbatore_unified_master_dataset_with_zone.csv',
-    ]
+    """Resolve operational data source from required runtime config."""
+    runtime_cfg = load_runtime_config()
+    data_path = runtime_cfg.get('data_path')
+    if not data_path:
+        raise KeyError("Runtime config missing required key: data_path")
+    return str(data_path)
 
-    for candidate in preferred:
-        full_candidate = os.path.join(os.path.dirname(__file__), candidate)
-        if os.path.exists(full_candidate):
-            return candidate
 
-    if not os.path.isdir(data_dir):
-        raise FileNotFoundError('data directory not found')
-    
-    csv_candidates = sorted([f for f in os.listdir(data_dir) if f.lower().endswith('.csv')])
-    if not csv_candidates:
-        raise FileNotFoundError('No CSV files found in data directory')
-    
-    return f"data/{csv_candidates[0]}"
+def _resolve_runtime_path(path_value: str) -> str:
+    if os.path.isabs(path_value):
+        return path_value
+    return os.path.join(os.path.dirname(__file__), path_value)
+
+
+def get_configured_runtime_paths() -> tuple[str, str]:
+    runtime_cfg = load_runtime_config()
+    model_path = runtime_cfg.get('model_artifact_path')
+    data_path = runtime_cfg.get('data_path')
+    if not model_path:
+        raise KeyError("Runtime config missing required key: model_artifact_path")
+    if not data_path:
+        raise KeyError("Runtime config missing required key: data_path")
+    return str(model_path), str(data_path)
+
+
+def validate_startup_integrity() -> tuple[str, str]:
+    model_path, data_path = get_configured_runtime_paths()
+    model_full_path = _resolve_runtime_path(model_path)
+    data_full_path = _resolve_runtime_path(data_path)
+
+    if not os.path.exists(model_full_path):
+        st.error(f"Critical file missing: {model_path}")
+        st.stop()
+    if not os.path.exists(data_full_path):
+        st.error(f"Critical file missing: {data_path}")
+        st.stop()
+
+    return model_path, data_path
 
 
 @st.cache_resource
 def load_predictor():
     """Load trained model from artifact (uses runtime config for model path)"""
     try:
-        from utils.runtime_config import load_runtime_config
-        runtime_cfg = load_runtime_config()
-        model_path = runtime_cfg.get('model_path', 'model/final_outbreak_model_v3.pkl')
-        full_model_path = os.path.join(os.path.dirname(__file__), model_path)
+        model_path, _ = get_configured_runtime_paths()
+        full_model_path = _resolve_runtime_path(model_path)
         if not os.path.exists(full_model_path):
             raise RuntimeError(f"Model artifact missing: {model_path}")
         predictor = OutbreakPredictor(model_path=model_path)
         predictor.load_model()
         return predictor, None
     except Exception as e:
-        return None, str(e)
+        st.error(f"Operational error: {str(e)}")
+        raise
 
 
 @st.cache_data
 def load_data(path: str):
     """Load dataset from CSV"""
     try:
-        full_path = os.path.join(os.path.dirname(__file__), path)
+        full_path = _resolve_runtime_path(path)
         df = pd.read_csv(full_path)
         return df, None
     except Exception as e:
-        return None, str(e)
+        st.error(f"Operational error: {str(e)}")
+        raise
 
 
 def get_alert_status_color(alert_load: float):
@@ -131,6 +146,21 @@ def get_alert_status_color(alert_load: float):
         return "🟡", "Elevated"
     else:
         return "🔴", "Emergency"
+
+
+def format_calibration_display(metadata: dict) -> tuple[str, str]:
+    calibration = metadata.get('calibration', {}) if isinstance(metadata, dict) else {}
+    method_raw = str(calibration.get('method', 'N/A')).strip().lower()
+    source_raw = str(
+        metadata.get('calibration_source', calibration.get('fitted_on', 'N/A'))
+        if isinstance(metadata, dict)
+        else 'N/A'
+    ).strip()
+
+    if method_raw == 'none' and source_raw in {'sklearn-version-mismatch', 'missing-isotonic-calibrator'}:
+        return 'Disabled', source_raw.replace('-', ' ').title()
+
+    return str(calibration.get('method', 'N/A')).title(), source_raw.upper()
 
 
 def get_prediction_history_path() -> str:
@@ -224,7 +254,98 @@ def render_data_fusion_summary(data: pd.DataFrame):
     ]
     preview_cols = [col for col in preview_cols if col in data.columns]
     if preview_cols:
-        st.dataframe(data[preview_cols].head(8), use_container_width=True, hide_index=True)
+        st.dataframe(data[preview_cols].head(8), width='stretch', hide_index=True)
+
+
+def render_disease_surveillance_summary(data: pd.DataFrame):
+    """Display current disease case statistics from surveillance data."""
+    if data is None or len(data) == 0:
+        st.info("Disease surveillance data unavailable.")
+        return
+
+    if 'week_start_date' not in data.columns:
+        st.warning("Cannot display disease statistics: week_start_date column missing.")
+        return
+
+    # Get latest week data
+    working = data[['week_start_date']].copy()
+    working['week_start_date'] = pd.to_datetime(working['week_start_date'], errors='coerce')
+    if working['week_start_date'].isna().all():
+        st.warning("Cannot display disease statistics: invalid date values.")
+        return
+
+    latest_week = working['week_start_date'].max()
+    latest_mask = pd.to_datetime(data['week_start_date'], errors='coerce') == latest_week
+    latest_df = data.loc[latest_mask]
+
+    # Check for disease columns
+    disease_cols = ['cholera_cases', 'typhoid_cases', 'dysentery_cases', 'hepatitis_a_cases']
+    has_disease_data = all(col in latest_df.columns for col in disease_cols)
+
+    if not has_disease_data:
+        st.info("ℹ️ Disease-specific case data not available in current dataset.")
+        return
+
+    # Calculate disease statistics
+    total_reported = int(latest_df['reported_cases'].sum()) if 'reported_cases' in latest_df.columns else 0
+    cholera_total = int(latest_df['cholera_cases'].sum())
+    typhoid_total = int(latest_df['typhoid_cases'].sum())
+    dysentery_total = int(latest_df['dysentery_cases'].sum())
+    hepatitis_total = int(latest_df['hepatitis_a_cases'].sum())
+
+    disease_sum = cholera_total + typhoid_total + dysentery_total + hepatitis_total
+
+    st.markdown("### 🦠 Current Disease Surveillance")
+    st.caption(f"Water-borne disease cases for week starting {latest_week.strftime('%Y-%m-%d')}")
+
+    # Display metrics
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("Total Reported Cases", f"{total_reported:,}")
+    with col2:
+        st.metric("🔵 Cholera", f"{cholera_total:,}", 
+                  help="Severe diarrheal infection caused by contaminated water")
+    with col3:
+        st.metric("🟣 Typhoid", f"{typhoid_total:,}",
+                  help="Bacterial infection spread through contaminated water/food")
+    with col4:
+        st.metric("🟠 Dysentery", f"{dysentery_total:,}",
+                  help="Intestinal infection causing severe diarrhea with blood")
+    with col5:
+        st.metric("🟡 Hepatitis A", f"{hepatitis_total:,}",
+                  help="Liver infection from contaminated water/food")
+
+    # Show disease distribution if data valid
+    if disease_sum > 0:
+        cholera_pct = (cholera_total / disease_sum * 100)
+        typhoid_pct = (typhoid_total / disease_sum * 100)
+        dysentery_pct = (dysentery_total / disease_sum * 100)
+        hepatitis_pct = (hepatitis_total / disease_sum * 100)
+
+        st.caption(
+            f"Distribution: Cholera {cholera_pct:.1f}% | "
+            f"Typhoid {typhoid_pct:.1f}% | "
+            f"Dysentery {dysentery_pct:.1f}% | "
+            f"Hepatitis A {hepatitis_pct:.1f}%"
+        )
+
+    # Show top affected wards
+    if 'ward_id' in latest_df.columns:
+        top_wards = latest_df.nlargest(5, 'reported_cases')[['ward_id', 'reported_cases', 'cholera_cases', 'typhoid_cases', 'dysentery_cases', 'hepatitis_a_cases']]
+        if len(top_wards) > 0:
+            with st.expander("📊 Top 5 Affected Wards (Current Week)", expanded=False):
+                st.dataframe(
+                    top_wards.rename(columns={
+                        'ward_id': 'Ward',
+                        'reported_cases': 'Total Cases',
+                        'cholera_cases': 'Cholera',
+                        'typhoid_cases': 'Typhoid',
+                        'dysentery_cases': 'Dysentery',
+                        'hepatitis_a_cases': 'Hepatitis A'
+                    }),
+                    hide_index=True,
+                    use_container_width=True
+                )
 
 
 def render_data_freshness_coverage_status(data: pd.DataFrame, data_loaded_at: datetime | None = None):
@@ -562,7 +683,7 @@ def simulate_intervention(predictor, ward_data: pd.DataFrame, intervention: dict
         
         # Apply intervention: reduce feature by specified percentage
         feature_name, reduction_pct = intervention['simulation_effect']
-        simulated_data = ward_data.copy().sort_values('week_start_date').reset_index(drop=True)
+        simulated_data = ward_data.copy(deep=True).sort_values('week_start_date').reset_index(drop=True)
         
         if feature_name in simulated_data.columns:
             latest_idx = simulated_data.index[-1]
@@ -587,6 +708,54 @@ def simulate_intervention(predictor, ward_data: pd.DataFrame, intervention: dict
         }
     except Exception as e:
         return {'error': str(e)}
+
+
+def generate_test_predictions_with_high_risk(
+    predictions_df: pd.DataFrame,
+    threshold: float,
+    num_high_risk: int = 8
+) -> pd.DataFrame:
+    """Generate test predictions with synthetic high-risk wards.
+    
+    This is purely for testing/demonstration of spatial features.
+    It does not affect actual predictions or stored data.
+    
+    Args:
+        predictions_df: Original predictions
+        threshold: Risk threshold
+        num_high_risk: Number of wards to elevate to high-risk
+    
+    Returns:
+        Modified predictions DataFrame with synthetic high-risk wards
+    """
+    from utils.spatial_viz import load_peripheral_wards
+    from utils.constants import MODERATE_RISK_RATIO
+    import numpy as np
+    
+    test_df = predictions_df.copy()
+    peripheral = load_peripheral_wards()
+    
+    # Select peripheral wards to elevate (prefer those with highest current probability)
+    if peripheral:
+        peripheral_in_data = test_df[test_df['ward_id'].isin(peripheral)]
+        if len(peripheral_in_data) >= num_high_risk:
+            # Select top wards by probability
+            candidates = peripheral_in_data.nlargest(num_high_risk, 'probability')
+        else:
+            # Fallback: select any wards
+            candidates = test_df.nlargest(num_high_risk, 'probability')
+    else:
+        candidates = test_df.nlargest(num_high_risk, 'probability')
+    
+    # Elevate probabilities to high-risk range (threshold + 0.05 to threshold + 0.15)
+    for idx in candidates.index:
+        synthetic_prob = threshold + np.random.uniform(0.05, 0.15)
+        test_df.loc[idx, 'probability'] = min(synthetic_prob, 0.95)  # Cap at 95%
+        test_df.loc[idx, 'prediction'] = 1
+        test_df.loc[idx, 'risk_level'] = 'High'
+        test_df.loc[idx, 'risk_score'] = (test_df.loc[idx, 'probability'] * 100).round(2)
+    
+    return test_df
 
 
 def create_heatmap_with_all_wards(
@@ -640,14 +809,14 @@ def create_heatmap_with_all_wards(
 
     # Render all zones (including those without predictions)
     for _, row in gdf_zones.iterrows():
-        risk_color = get_risk_color(row.get('risk', 'Low')) if pd.notna(row.get('risk')) else '#cccccc'
+        risk_color = get_risk_color(row.get('risk_level', 'Low')) if pd.notna(row.get('risk_level')) else '#cccccc'
         
         tooltip_text = f"<b>Zone:</b> {row['name']}<br>"
         if pd.notna(row.get('avg_probability')):
             tooltip_text += (
                 f"<b>Avg Probability:</b> {row['avg_probability']:.2f}<br>"
                 f"<b>Wards:</b> {int(row['ward_count'])}<br>"
-                f"<b>Risk:</b> {row['risk']}"
+                f"<b>Risk:</b> {row['risk_level']}"
             )
         else:
             tooltip_text += "<b>Status:</b> No data"
@@ -710,6 +879,7 @@ def create_heatmap_with_all_wards(
     return m
 
 
+# Legacy utility - not wired in operational flow
 def display_alert_list(predictions_df: pd.DataFrame, threshold: float, max_display: int = 10):
     """Display ranked alert list"""
     high_risk = predictions_df[predictions_df['probability'] >= threshold].sort_values('probability', ascending=False)
@@ -721,13 +891,13 @@ def display_alert_list(predictions_df: pd.DataFrame, threshold: float, max_displ
     st.error(f"🚨 **{len(high_risk)} WARD(S) ABOVE THRESHOLD** (≥ {threshold:.2f})")
     st.markdown("**Ranked by outbreak probability (highest first)**")
 
-    display_data = high_risk[['ward_id', 'probability', 'risk']].head(max_display).copy()
+    display_data = high_risk[['ward_id', 'probability', 'risk_level']].head(max_display).copy()
     display_data['Zone'] = display_data['ward_id'].apply(map_ward_to_zone)
     display_data['Probability %'] = display_data['probability'].apply(lambda x: f"{x:.1%}")
-    display_data = display_data[['ward_id', 'Zone', 'Probability %', 'risk']]
-    display_data = display_data.rename(columns={'ward_id': 'Ward', 'risk': 'Risk Level'})
+    display_data = display_data[['ward_id', 'Zone', 'Probability %', 'risk_level']]
+    display_data = display_data.rename(columns={'ward_id': 'Ward', 'risk_level': 'Risk Level'})
 
-    st.dataframe(display_data, use_container_width=True, hide_index=True)
+    st.dataframe(display_data, width='stretch', hide_index=True)
 
     if len(high_risk) > max_display:
         st.info(f"Showing top {max_display} of {len(high_risk)} alerts")
@@ -770,6 +940,7 @@ def page_operational_monitoring():
     predictor = None
     data = None
     predictions = None
+    forward_projection_df = None
     model_metadata = None
     data_loaded_at = None
     error_occurred = False
@@ -798,6 +969,8 @@ def page_operational_monitoring():
     if not error_occurred and predictor and data is not None:
         st.markdown("---")
         render_data_fusion_summary(data)
+        st.markdown("---")
+        render_disease_surveillance_summary(data)
         st.markdown("---")
         render_data_freshness_coverage_status(data, data_loaded_at=data_loaded_at)
 
@@ -849,9 +1022,26 @@ def page_operational_monitoring():
                     error_occurred = True
                     engineered_df = None
 
+        if error_occurred or predictions is None or model_metadata is None:
+            return
+
         # ===================================================================
         # SIDEBAR: WHAT-IF RISK SIMULATOR
         # ===================================================================
+
+        st.sidebar.markdown("---")
+        enable_forward_projection = st.sidebar.checkbox(
+            "Enable 14-Day Forward Projection",
+            value=False,
+            key='enable_14_day_forward_projection'
+        )
+
+        if enable_forward_projection:
+            try:
+                forward_projection_df = predictor.predict_forward_projection(df=data, horizon_weeks=2)
+            except (ValueError, KeyError, TypeError, RuntimeError, FileNotFoundError, OSError):
+                st.warning("14-day projection temporarily unavailable.")
+                forward_projection_df = None
 
         st.sidebar.markdown("---")
         st.sidebar.markdown("### 🎯 What-If Risk Simulator")
@@ -901,13 +1091,14 @@ def page_operational_monitoring():
 
             # Compute what-if scenario
             if st.session_state.what_if_ward:
-                ward_data = data[data['ward_id'] == st.session_state.what_if_ward].copy()
+                simulated_df = data.copy(deep=True)
+                ward_data = simulated_df[simulated_df['ward_id'] == st.session_state.what_if_ward].copy(deep=True)
                 if len(ward_data) > 0:
                     # Get baseline prediction
                     baseline_pred = predictions[predictions['ward_id'] == st.session_state.what_if_ward]
                     if len(baseline_pred) > 0:
                         baseline_prob = baseline_pred['probability'].iloc[0]
-                        baseline_risk = baseline_pred['risk'].iloc[0]
+                        baseline_risk = baseline_pred['risk_level'].iloc[0]
                     else:
                         baseline_prob = 0.0
                         baseline_risk = 'Unknown'
@@ -921,7 +1112,7 @@ def page_operational_monitoring():
                     col1.caption(f"Risk: {baseline_risk}")
                     
                     # Create scenario with adjusted values only on latest row
-                    scenario = ward_data.copy().sort_values('week_start_date').reset_index(drop=True)
+                    scenario = ward_data.copy(deep=True).sort_values('week_start_date').reset_index(drop=True)
                     latest_idx = scenario.index[-1]
                     scenario.loc[latest_idx, 'rainfall_mm'] = st.session_state.what_if_rainfall
                     scenario.loc[latest_idx, 'turbidity'] = st.session_state.what_if_turbidity
@@ -932,7 +1123,7 @@ def page_operational_monitoring():
                         scenario_pred = predictor.predict_latest_week(df=scenario)
                         if len(scenario_pred) > 0:
                             scenario_prob = scenario_pred['probability'].iloc[0]
-                            scenario_risk = scenario_pred['risk'].iloc[0]
+                            scenario_risk = scenario_pred['risk_level'].iloc[0]
                             
                             col2.write("**Scenario**")
                             col2.metric("Adjusted", f"{scenario_prob:.1%}", label_visibility='collapsed')
@@ -987,27 +1178,23 @@ def page_operational_monitoring():
         if 'global_threshold' not in model_metadata or model_metadata.get('global_threshold') is None:
             st.error(f"❌ Model metadata missing required global_threshold. {OPERATIONAL_MODE_LABEL} halted.")
             return
-        threshold = float(model_metadata['global_threshold'])
+        artifact_threshold = float(model_metadata['global_threshold'])
+        threshold = float(GLOBAL_THRESHOLD)
 
         if predictor is None:
             st.error("❌ Predictor instance unavailable. Operational mode halted.")
             return
 
-        threshold_tolerance = 5e-3
-        if abs(threshold - float(GLOBAL_THRESHOLD)) > threshold_tolerance:
+        if not np.isclose(artifact_threshold, float(GLOBAL_THRESHOLD), atol=1e-9):
             st.error(
-                f"❌ Threshold policy drift detected: artifact={threshold:.6f}, expected={float(GLOBAL_THRESHOLD):.6f}, "
-                f"tolerance=±{threshold_tolerance:.6f}. "
+                f"❌ Threshold policy drift detected: artifact={artifact_threshold:.6f}, expected={float(GLOBAL_THRESHOLD):.6f}. "
                 f"{OPERATIONAL_MODE_LABEL} halted."
             )
             return
 
         if len(predictions) != 100:
-            st.error(
-                f"❌ Prediction cardinality mismatch: got {len(predictions)} wards, expected 100. "
-                f"{OPERATIONAL_MODE_LABEL} halted."
-            )
-            return
+            st.error(f"Ward cardinality mismatch: Expected 100, got {len(predictions)}")
+            st.stop()
         
         # ===================================================================
         # AUTOMATION STATUS: Confirm monitoring flow
@@ -1045,7 +1232,7 @@ def page_operational_monitoring():
             st.metric("Decision Threshold", f"{threshold:.3f}")
         with col4:
             # Compute % of high-risk wards that are peripheral (display-only)
-            high_risk_df = predictions[predictions['risk_class'] == 'High']
+            high_risk_df = predictions[predictions['risk_level'] == 'High']
             if 'is_peripheral_ward' in predictions.columns and len(high_risk_df) > 0:
                 peripheral_high = high_risk_df[high_risk_df['is_peripheral_ward'] == 1]
                 peripheral_pct = (len(peripheral_high) / len(high_risk_df)) * 100
@@ -1083,7 +1270,7 @@ def page_operational_monitoring():
                     st.metric("Risk", f"{row['probability']:.1%}", label_visibility='collapsed')
                 
                 with col3:
-                    risk_level = row['risk']
+                    risk_level = row['risk_level']
                     if risk_level == 'High':
                         st.error(risk_level)
                     elif risk_level == 'Moderate':
@@ -1118,7 +1305,7 @@ def page_operational_monitoring():
                     with col2:
                         st.markdown("**📈 Risk Level Details:**")
                         st.metric("Outbreak Probability", f"{row['probability']:.1%}")
-                        st.metric("Risk Classification", row['risk'])
+                        st.metric("Risk Classification", row['risk_level'])
                         st.metric("Decision Threshold", f"{threshold:.3f}")
                     
                     st.markdown("---")
@@ -1158,6 +1345,34 @@ def page_operational_monitoring():
             
             if len(high_risk) > 10:
                 st.info(f"Showing top 10 of {len(high_risk)} alerts")
+
+        if forward_projection_df is not None and len(forward_projection_df) > 0:
+            st.markdown("---")
+            with st.expander("🗓️ 14-Day Forward Projection", expanded=False):
+                week1_df = (
+                    forward_projection_df[forward_projection_df['forecast_horizon_week'] == 1]
+                    .sort_values('probability', ascending=False)
+                    .reset_index(drop=True)
+                )
+                week2_df = (
+                    forward_projection_df[forward_projection_df['forecast_horizon_week'] == 2]
+                    .sort_values('probability', ascending=False)
+                    .reset_index(drop=True)
+                )
+
+                st.markdown("**Week +1 (7 days ahead)**")
+                st.dataframe(
+                    week1_df[['ward_id', 'probability', 'risk_level', 'prediction']],
+                    width='stretch',
+                    hide_index=True,
+                )
+
+                st.markdown("**Week +2 (14 days ahead)**")
+                st.dataframe(
+                    week2_df[['ward_id', 'probability', 'risk_level', 'prediction']],
+                    width='stretch',
+                    hide_index=True,
+                )
         
         # Display resolved alerts
         if len(st.session_state.resolved_alerts) > 0:
@@ -1179,7 +1394,7 @@ def page_operational_monitoring():
 
         col1, col2, col3, col4, col5 = st.columns(5)
         
-        risk_counts = predictions['risk'].value_counts()
+        risk_counts = predictions['risk_level'].value_counts()
         total_wards = len(predictions)
         
         col1.metric("Total Wards Monitored", total_wards)
@@ -1187,6 +1402,38 @@ def page_operational_monitoring():
         col3.metric("🟡 Moderate Risk", risk_counts.get('Moderate', 0))
         col4.metric("🔴 High Risk", risk_counts.get('High', 0))
         col5.metric("Alert Load", f"{alert_load:.1%}")
+
+        # ===================================================================
+        # OUTLIER DIAGNOSTICS (COMPACT)
+        # ===================================================================
+
+        st.markdown("### 🔎 OUTLIER DIAGNOSTICS (COMPACT)")
+        top_probability = float(predictions['probability'].max()) if len(predictions) > 0 else 0.0
+        p95_probability = float(predictions['probability'].quantile(0.95)) if len(predictions) > 0 else 0.0
+        top_outliers = (
+            predictions
+            .sort_values('probability', ascending=False)
+            .head(5)
+            .copy()
+        )
+
+        od_col1, od_col2, od_col3 = st.columns(3)
+        od_col1.metric("Top Probability", f"{top_probability:.1%}")
+        od_col2.metric("95th Percentile", f"{p95_probability:.1%}")
+        od_col3.metric("Above Threshold", int((predictions['probability'] >= threshold).sum()))
+
+        outlier_table = top_outliers[['ward_id', 'probability', 'risk_level']].copy()
+        outlier_table['probability'] = outlier_table['probability'].apply(lambda value: f"{value:.1%}")
+        outlier_table = outlier_table.rename(
+            columns={
+                'ward_id': 'Ward',
+                'probability': 'Probability',
+                'risk_level': 'Risk Level',
+            }
+        )
+        st.dataframe(outlier_table, width='stretch', hide_index=True)
+        if int((predictions['probability'] >= threshold).sum()) == 0:
+            st.info("No wards currently exceed threshold. Monitor Top Probability and 95th Percentile for early drift.")
 
         # ===================================================================
         # PREDICTION HISTORY TRACKING + TREND
@@ -1217,16 +1464,32 @@ def page_operational_monitoring():
             if 'date' in history_df.columns:
                 history_df['date'] = pd.to_datetime(history_df['date'], errors='coerce')
                 history_df = history_df.dropna(subset=['date']).sort_values('date')
-                history_df = history_df.set_index('date')
+                history_df['date'] = history_df['date'].dt.floor('D')
+                history_df['high_risk_wards'] = pd.to_numeric(history_df.get('high_risk_wards', 0), errors='coerce').fillna(0)
+                history_df['alert_load_pct'] = pd.to_numeric(history_df.get('alert_load_pct', 0), errors='coerce').fillna(0)
+
+                history_df = (
+                    history_df
+                    .groupby('date', as_index=False)
+                    .agg(
+                        high_risk_wards=('high_risk_wards', 'max'),
+                        alert_load_pct=('alert_load_pct', 'mean'),
+                    )
+                    .sort_values('date')
+                    .set_index('date')
+                )
 
                 if len(history_df) >= 2:
                     col_hist_1, col_hist_2 = st.columns(2)
                     with col_hist_1:
-                        st.caption("High-risk wards over time")
+                        st.caption("High-risk wards by day")
                         st.line_chart(history_df['high_risk_wards'])
                     with col_hist_2:
-                        st.caption("Alert load percentage over time")
+                        st.caption("Alert load percentage by day")
                         st.line_chart(history_df['alert_load_pct'])
+
+                    if float(history_df['high_risk_wards'].sum()) == 0.0 and float(history_df['alert_load_pct'].sum()) == 0.0:
+                        st.info("All recorded days are currently at zero alert load. This indicates stable risk conditions, not missing data.")
                 elif len(history_df) == 1:
                     st.info("📊 Trend data will accumulate over multiple prediction cycles. Current history: 1 entry. Check back after next operational cycle.")
                     col_hist_1, col_hist_2 = st.columns(2)
@@ -1262,8 +1525,27 @@ def page_operational_monitoring():
                 value=False,
                 help="Highlight wards surrounded by high-risk neighbors"
             )
+
+        if show_influence_arrows or show_neighbor_overlay:
+            spatial_overlay_status = get_spatial_viz_summary(predictions)
+            if not spatial_overlay_status.get('all_available', False):
+                show_influence_arrows = False
+                show_neighbor_overlay = False
+                st.warning("Spatial overlay temporarily disabled - adjacency validation pending.")
+            else:
+                # Check if there are high-risk wards to visualize
+                high_risk_count = len(predictions[predictions['risk_level'] == 'High'])
+                if high_risk_count == 0:
+                    st.info(
+                        "ℹ️ **Spatial features enabled but no high-risk wards detected.**  \n"
+                        f"Current predictions show {len(predictions)} wards: "
+                        f"{len(predictions[predictions['risk_level'] == 'Low'])} Low, "
+                        f"{len(predictions[predictions['risk_level'] == 'Moderate'])} Moderate.  \n"
+                        "💡 **Test options:** Lower threshold to ~0.13 in What-If Simulator, "
+                        "or use Test Mode below to inject synthetic high-risk wards."
+                    )
         
-        # Peripheral risk indicator
+        # Peripheral risk indicator & Test mode
         with spatial_col3:
             peripheral_indicator = compute_peripheral_indicator(predictions)
             if peripheral_indicator and peripheral_indicator.get('available'):
@@ -1275,7 +1557,14 @@ def page_operational_monitoring():
                         delta_color="off"
                     )
                 else:
-                    st.metric("Peripheral High-Risk Wards", "N/A", delta="No high-risk wards")
+                    st.metric("Peripheral High-Risk Wards", "N/A", delta="✨ No high-risk wards")
+            
+            # Test mode for demonstrating spatial features
+            use_test_mode = st.checkbox(
+                "🧪 Test Mode",
+                value=False,
+                help="Generate synthetic high-risk wards to demonstrate spatial features"
+            )
         
         # Simulation toggle (separate row)
         sim_col1, sim_col2 = st.columns([1, 3])
@@ -1336,7 +1625,14 @@ def page_operational_monitoring():
                 # Create a view DataFrame for rendering with simulated probabilities
                 render_df = sim_df.copy()
                 render_df['probability'] = render_df['simulated_probability']
-                render_df['risk'] = render_df['simulated_risk']
+                render_df['risk_level'] = render_df['simulated_risk_level']
+            elif use_test_mode:
+                # Generate synthetic high-risk wards for testing spatial features
+                render_df = generate_test_predictions_with_high_risk(predictions, threshold, num_high_risk=8)
+                st.info(
+                    "🧪 **TEST MODE**: Synthetic high-risk wards injected for demonstration.  \\n"
+                    "This is temporary and does not affect actual predictions or stored data."
+                )
             else:
                 render_df = predictions
             
@@ -1382,19 +1678,19 @@ def page_operational_monitoring():
                     affected = sim_df[sim_df['spread_delta'] > 0.001].sort_values('spread_delta', ascending=False)
                     if len(affected) > 0:
                         st.markdown("**Top Affected Wards:**")
-                        affected_display = affected[['ward_id', 'probability', 'simulated_probability', 'spread_delta', 'risk', 'simulated_risk']].head(10).copy()
+                        affected_display = affected[['ward_id', 'probability', 'simulated_probability', 'spread_delta', 'risk_level', 'simulated_risk_level']].head(10).copy()
                         affected_display = affected_display.rename(columns={
                             'ward_id': 'Ward',
                             'probability': 'Original P',
                             'simulated_probability': 'Simulated P',
                             'spread_delta': 'Delta',
-                            'risk': 'Original Risk',
-                            'simulated_risk': 'Simulated Risk'
+                            'risk_level': 'Original Risk',
+                            'simulated_risk_level': 'Simulated Risk'
                         })
                         affected_display['Original P'] = affected_display['Original P'].apply(lambda x: f"{x:.1%}")
                         affected_display['Simulated P'] = affected_display['Simulated P'].apply(lambda x: f"{x:.1%}")
                         affected_display['Delta'] = affected_display['Delta'].apply(lambda x: f"+{x:.1%}")
-                        st.dataframe(affected_display, use_container_width=True, hide_index=True)
+                        st.dataframe(affected_display, width='stretch', hide_index=True)
 
         # ===================================================================
         # SPATIAL SPREAD ANALYSIS (Optional Expander)
@@ -1456,17 +1752,17 @@ def page_operational_monitoring():
         table_df['Zone'] = table_df['ward_id'].apply(map_ward_to_zone)
         table_df['Probability %'] = (table_df['probability'] * 100).round(1).astype(str) + '%'
         
-        display_cols = ['ward_id', 'Zone', 'probability', 'Probability %', 'risk']
+        display_cols = ['ward_id', 'Zone', 'probability', 'Probability %', 'risk_level']
         table_df = table_df[display_cols].sort_values('probability', ascending=False)
         table_df = table_df.rename(columns={
             'ward_id': 'Ward',
             'probability': 'Outbreak Probability',
-            'risk': 'Risk Level'
+            'risk_level': 'Risk Level'
         })
 
         st.dataframe(
             table_df,
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={
                 'Ward': st.column_config.TextColumn('Ward', width=80),
@@ -1492,16 +1788,14 @@ def page_operational_monitoring():
 
         metadata = model_metadata
         cv_metrics = metadata.get('cv_metrics', {})
-        global_threshold = metadata.get('global_threshold')
-        global_threshold_text = f"{float(global_threshold):.3f}" if global_threshold is not None else 'N/A'
+        global_threshold_text = f"{float(GLOBAL_THRESHOLD):.3f}"
 
         col1, col2, col3, col4 = st.columns(4)
 
         col1.metric("CV Recall", f"{cv_metrics.get('recall_mean', 0):.2%} ± {cv_metrics.get('recall_std', 0):.2%}")
         col2.metric("CV F1-Score", f"{cv_metrics.get('f1_mean', 0):.1%}")
         col3.metric("CV ROC-AUC", f"{cv_metrics.get('roc_auc_mean', 0):.4f} ± {cv_metrics.get('roc_auc_std', 0):.4f}")
-        calibration_method = str(metadata.get('calibration', {}).get('method', 'N/A')).title()
-        calibration_source = str(metadata.get('calibration_source', metadata.get('calibration', {}).get('fitted_on', 'N/A'))).upper()
+        calibration_method, calibration_source = format_calibration_display(metadata)
         col4.metric("Calibration", f"{calibration_method} ({calibration_source})")
 
         col1, col2, col3, col4 = st.columns(4)
@@ -1561,7 +1855,7 @@ def page_operational_monitoring():
                             'ROC-AUC': f"{fold['roc_auc']:.4f}",
                         })
                 if fold_data:
-                    st.dataframe(fold_data, use_container_width=True, hide_index=True)
+                    st.dataframe(fold_data, width='stretch', hide_index=True)
 
             st.markdown("#### Model Configuration")
             st.json({
@@ -1584,13 +1878,17 @@ def page_operational_monitoring():
 
     else:
         if error_occurred:
+            try:
+                configured_model_path, configured_data_path = get_configured_runtime_paths()
+            except (KeyError, ValueError, RuntimeError, FileNotFoundError):
+                configured_model_path, configured_data_path = "<missing in config>", "<missing in config>"
             st.error(f"⚠️ Cannot enter {OPERATIONAL_MODE_LABEL}. Please check model and data availability.")
             st.markdown("""
             **Troubleshooting:**
-            - Verify model exists at: `model/final_outbreak_model_v3.pkl`
-            - Verify data file exists in `data/` directory
+            - Verify model exists at configured path: `{}`
+            - Verify data file exists at configured path: `{}`
             - Check logs for detailed error messages
-            """)
+            """.format(configured_model_path, configured_data_path))
         else:
             st.warning("⚠️ System initialization failed.")
 
@@ -1601,6 +1899,7 @@ def page_operational_monitoring():
 
 def page_admin():
     """Admin page for retraining model"""
+    _, configured_data_path = get_configured_runtime_paths()
     st.title("⚙️ Administration Panel")
     st.markdown("**Advanced Operations** — Model retraining, data validation, diagnostics")
 
@@ -1616,7 +1915,7 @@ def page_admin():
     with col1:
         data_path = st.text_input(
             "Data file path",
-            value="data/coimbatore_unified_master_dataset_with_zone.csv",
+            value=configured_data_path,
             help="CSV file with historical outbreak data"
         )
 
@@ -1626,13 +1925,14 @@ def page_admin():
             help="Add neighbor lag + peripheral ward features (7 additional features)")
 
     # Determine model path based on spatial features
+    configured_model_path, _ = get_configured_runtime_paths()
     if include_spatial:
-        model_output_path = 'artifacts/outbreak_model_spatial_v1.pkl'
-        st.info("🌐 Spatial model selected — will save to `artifacts/outbreak_model_spatial_v1.pkl`")
+        model_output_path = configured_model_path
+        st.info(f"🌐 Spatial model selected — will save to `{configured_model_path}`")
     else:
-        model_output_path = 'model/final_outbreak_model_v3.pkl'
+        model_output_path = configured_model_path
 
-    if st.button("🚀 Retrain Model on Full Dataset", type="primary", use_container_width=True):
+    if st.button("🚀 Retrain Model on Full Dataset", type="primary", width='stretch'):
         st.info("🔄 Training started... This may take several minutes.")
 
         try:
@@ -1650,8 +1950,7 @@ def page_admin():
             # Display results
             if hasattr(trainer, 'metrics'):
                 cv_metrics = trainer.metrics.get('cv_metrics', {})
-                trained_threshold = trainer.metrics.get('global_threshold')
-                trained_threshold_text = f"{float(trained_threshold):.3f}" if trained_threshold is not None else 'N/A'
+                trained_threshold_text = f"{float(GLOBAL_THRESHOLD):.3f}"
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("CV Recall", f"{cv_metrics.get('recall_mean', 0):.1%}")
                 col2.metric("CV F1", f"{cv_metrics.get('f1_mean', 0):.1%}")
@@ -1674,8 +1973,7 @@ def page_admin():
             st.success(f"✅ Artifact {metadata.get('artifact_version', 'N/A')} deployed and ready")
             
             cv_metrics = metadata.get('cv_metrics', {})
-            threshold_value = metadata.get('global_threshold')
-            threshold_text = f"{float(threshold_value):.3f}" if threshold_value is not None else 'N/A'
+            threshold_text = f"{float(GLOBAL_THRESHOLD):.3f}"
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("CV Recall", f"{cv_metrics.get('recall_mean', 0):.1%}")
             col2.metric("CV F1", f"{cv_metrics.get('f1_mean', 0):.1%}")
@@ -1787,8 +2085,7 @@ def display_system_readiness(metadata: dict | None = None, data_path: str | None
             st.markdown("#### 📅 Model Management")
             metadata = metadata or {}
             training_range = metadata.get('training_data_range', {})
-            threshold_value = metadata.get('global_threshold')
-            threshold_text = f"{float(threshold_value):.3f}" if threshold_value is not None else 'N/A'
+            threshold_text = f"{float(GLOBAL_THRESHOLD):.3f}"
             st.write(f"• **Artifact Version:** {metadata.get('artifact_version', 'N/A')}")
             st.write(f"• **Training Date:** {metadata.get('trained_at_utc', 'N/A')}")
             st.write(f"• **Retraining Frequency:** {metadata.get('retraining_frequency_days', 'N/A')} days")
@@ -1822,11 +2119,10 @@ def display_system_readiness(metadata: dict | None = None, data_path: str | None
             mapping_df = pd.DataFrame([
                 {'Ward Range': k, 'Zone': v} for k, v in ward_zones.items()
             ])
-            st.dataframe(mapping_df, use_container_width=True, hide_index=True)
+            st.dataframe(mapping_df, width='stretch', hide_index=True)
         
         st.markdown("---")
-        threshold_value = (metadata or {}).get('global_threshold')
-        threshold_text = f"{float(threshold_value):.3f}" if threshold_value is not None else 'N/A'
+        threshold_text = f"{float(GLOBAL_THRESHOLD):.3f}"
         st.markdown("#### 🏗️ System Architecture")
         st.markdown(f"""
         ```
@@ -1903,11 +2199,7 @@ def page_temporal_monitoring():
         return
 
     metadata = predictor.get_model_metadata()
-    threshold_value = metadata.get('global_threshold')
-    if threshold_value is None:
-        st.error("Cannot render temporal monitoring: missing global_threshold in model metadata")
-        return
-    threshold = float(threshold_value)
+    threshold = float(GLOBAL_THRESHOLD)
 
     # Get ward data (past 6 weeks)
     ward_data = data[data['ward_id'] == selected_ward].tail(6).sort_values('week_start_date')
@@ -1947,7 +2239,7 @@ def page_temporal_monitoring():
                 hovermode='x unified',
                 height=300
             )
-            st.plotly_chart(fig_cases, use_container_width=True)
+            st.plotly_chart(fig_cases, width='stretch')
         
         with col2:
             # Rainfall trend
@@ -1967,7 +2259,7 @@ def page_temporal_monitoring():
                 hovermode='x unified',
                 height=300
             )
-            st.plotly_chart(fig_rain, use_container_width=True)
+            st.plotly_chart(fig_rain, width='stretch')
         
         col1, col2 = st.columns(2)
         
@@ -1999,7 +2291,7 @@ def page_temporal_monitoring():
                     hovermode='x unified',
                     height=300
                 )
-            st.plotly_chart(fig_contamination, use_container_width=True)
+            st.plotly_chart(fig_contamination, width='stretch')
         
         with col2:
             # Trend summary
@@ -2051,7 +2343,7 @@ def page_temporal_monitoring():
                 
                 col2.metric(
                     "Risk Level",
-                    pred['risk'],
+                    pred['risk_level'],
                     help="Classification: Low/Moderate/High"
                 )
                 
@@ -2086,7 +2378,7 @@ def page_temporal_monitoring():
         
         st.dataframe(
             ward_data[display_cols],
-            use_container_width=True,
+            width='stretch',
             hide_index=True
         )
 
@@ -2111,12 +2403,10 @@ def page_model_intelligence():
     cv_metrics = metadata.get('cv_metrics', {})
     training_range = metadata.get('training_data_range', {})
     calibration = metadata.get('calibration', {})
-    calibration_method = str(calibration.get('method', 'N/A')).title()
-    calibration_source = str(metadata.get('calibration_source', calibration.get('fitted_on', 'N/A'))).upper()
+    calibration_method, calibration_source = format_calibration_display(metadata)
 
     st.markdown("#### Production Snapshot")
-    threshold_value = metadata.get('global_threshold')
-    threshold_text = f"{float(threshold_value):.2f}" if threshold_value is not None else 'N/A'
+    threshold_text = f"{float(GLOBAL_THRESHOLD):.2f}"
     col1, col2, col3 = st.columns(3)
     col1.metric("Artifact Version", str(metadata.get('artifact_version', 'N/A')))
     col2.metric("Global Threshold", threshold_text)
@@ -2146,10 +2436,10 @@ def page_model_intelligence():
                     'Precision': f"{fold.get('precision', 0):.1%}",
                     'F1': f"{fold.get('f1', fold.get('f1_score', 0)):.1%}",
                     'ROC-AUC': f"{fold.get('roc_auc', 0):.4f}",
-                    'Threshold': f"{fold.get('threshold', fold.get('best_threshold', threshold_value if threshold_value is not None else float('nan'))):.2f}",
+                    'Threshold': f"{fold.get('threshold', fold.get('best_threshold', float(GLOBAL_THRESHOLD))):.2f}",
                 })
             if fold_data:
-                st.dataframe(fold_data, use_container_width=True, hide_index=True)
+                st.dataframe(fold_data, width='stretch', hide_index=True)
         st.info("Thresholds are tuned only on validation folds; final global threshold is fold-mean for operational use.")
 
     with tab2:
@@ -2157,13 +2447,13 @@ def page_model_intelligence():
         feature_columns = predictor.feature_columns if predictor.feature_columns is not None else []
         st.write(f"Total features: {len(feature_columns)}")
         if feature_columns:
-            st.dataframe(pd.DataFrame({'feature': feature_columns}), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame({'feature': feature_columns}), width='stretch', hide_index=True)
 
     with tab3:
         st.markdown("#### Calibration Details")
         st.write(f"**Method:** {calibration_method}")
         st.write(f"**Source:** {calibration_source}")
-        threshold_text_cal = f"{float(threshold_value):.3f}" if threshold_value is not None else 'N/A'
+        threshold_text_cal = f"{float(GLOBAL_THRESHOLD):.3f}"
         st.write(f"**Decision Threshold:** {threshold_text_cal}")
 
     with tab4:
@@ -2234,7 +2524,7 @@ def page_environmental_analysis():
                 width=600
             )
             
-            st.plotly_chart(fig_heatmap, use_container_width=True)
+            st.plotly_chart(fig_heatmap, width='stretch')
             
             # Correlation analysis basis
             corr_sample_size = len(data)
@@ -2297,7 +2587,7 @@ def page_environmental_analysis():
                         height=300,
                         xaxis=dict(categoryorder='array', categoryarray=monthly_cases['month_name'].tolist())
                     )
-                    st.plotly_chart(fig_monthly_cases, use_container_width=True)
+                    st.plotly_chart(fig_monthly_cases, width='stretch')
 
                 with col2:
                     # Monthly rainfall
@@ -2315,7 +2605,7 @@ def page_environmental_analysis():
                         height=300,
                         xaxis=dict(categoryorder='array', categoryarray=monthly_rainfall['month_name'].tolist())
                     )
-                    st.plotly_chart(fig_monthly_rain, use_container_width=True)
+                    st.plotly_chart(fig_monthly_rain, width='stretch')
 
                 # Seasonal insight
                 st.info("""
@@ -2345,7 +2635,7 @@ def page_environmental_analysis():
             zone_stats = data.groupby('zone').agg(agg_map).round(1)
             
             st.markdown("**Average Metrics by Zone:**")
-            st.dataframe(zone_stats, use_container_width=True)
+            st.dataframe(zone_stats, width='stretch')
             
             # Heatmap: zones vs metrics
             fig_zone_heatmap = go.Figure(data=go.Heatmap(
@@ -2360,7 +2650,7 @@ def page_environmental_analysis():
                 height=300
             )
             
-            st.plotly_chart(fig_zone_heatmap, use_container_width=True)
+            st.plotly_chart(fig_zone_heatmap, width='stretch')
 
 
 def page_data_integration():
@@ -2389,7 +2679,7 @@ def page_data_integration():
             display_cols = [col for col in display_cols if col in integrated_ds.columns]
             st.dataframe(
                 integrated_ds[display_cols].head(20),
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
         else:
@@ -2459,7 +2749,7 @@ def page_data_integration():
         st.session_state.integration_report = None
     
     # Load and integrate data
-    if st.button("🔗 INTEGRATE DATA", type="primary", use_container_width=True):
+    if st.button("🔗 INTEGRATE DATA", type="primary", width='stretch'):
         with st.spinner("Loading and integrating data sources..."):
             try:
                 # Load from auto-load sources
@@ -2572,7 +2862,7 @@ def page_data_integration():
             
             st.dataframe(
                 st.session_state.integration_data[display_cols].head(20),
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
             
@@ -2592,6 +2882,8 @@ def page_data_integration():
 
 def main():
     """Main app router"""
+    validate_startup_integrity()
+
     # Sidebar navigation
     st.sidebar.title("📱 Navigation")
     page = st.sidebar.radio(

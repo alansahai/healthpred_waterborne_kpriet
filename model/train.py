@@ -31,7 +31,6 @@ from utils.constants import (
     GLOBAL_THRESHOLD,
     SELECTION_F1_WEIGHT,
     SELECTION_RECALL_WEIGHT,
-    THRESHOLD_FALLBACK,
 )
 
 try:
@@ -52,7 +51,7 @@ class OutbreakModelTrainer:
         self.feature_columns = get_model_feature_columns(include_spatial=include_spatial_features)
         self.metrics = {}
         self.best_params = {}
-        self.best_threshold = THRESHOLD_FALLBACK
+        self.best_threshold = float(GLOBAL_THRESHOLD)
         self.calibration = {'method': 'none'}
 
     @property
@@ -140,8 +139,8 @@ class OutbreakModelTrainer:
         return (SELECTION_RECALL_WEIGHT * metrics['recall']) + (SELECTION_F1_WEIGHT * metrics['f1_score'])
 
     def _tune_threshold(self, y_true, y_proba):
-        best_threshold = THRESHOLD_FALLBACK
-        best_metrics = self._evaluate(y_true, (y_proba >= THRESHOLD_FALLBACK).astype(int), y_proba)
+        best_threshold = float(GLOBAL_THRESHOLD)
+        best_metrics = self._evaluate(y_true, (y_proba >= float(GLOBAL_THRESHOLD)).astype(int), y_proba)
         best_score = self._score_for_selection(best_metrics)
 
         curve = []
@@ -630,7 +629,7 @@ class OutbreakModelTrainer:
             self.feature_columns = payload.get('feature_columns', payload.get('feature_list', self.feature_columns))
             self.metrics = payload.get('metrics', {})
             self.best_params = payload.get('best_params', {})
-            self.best_threshold = payload.get('best_threshold', self.metrics.get('best_threshold', THRESHOLD_FALLBACK))
+            self.best_threshold = float(payload.get('best_threshold', self.metrics.get('best_threshold', GLOBAL_THRESHOLD)))
             self.calibration = payload.get('calibration', self.metrics.get('calibration', {'method': 'none'}))
 
     def _apply_probability_adjustment(self, probabilities):

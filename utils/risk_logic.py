@@ -1,10 +1,10 @@
 """
 Risk Classification and Alert Logic
 """
-from .constants import MODERATE_RISK_RATIO, SCATTER_POINT_OPACITY, THRESHOLD_FALLBACK
+from .constants import GLOBAL_THRESHOLD, MODERATE_RISK_RATIO, SCATTER_POINT_OPACITY
 
 
-def classify_risk(probability, threshold=THRESHOLD_FALLBACK):
+def classify_risk(probability, threshold=GLOBAL_THRESHOLD):
     """
     Classify outbreak risk based on probability
     
@@ -62,7 +62,8 @@ def get_risk_color_rgba(risk_level, opacity=SCATTER_POINT_OPACITY):
     return rgba_map.get(risk_level, f"rgba(200, 200, 200, {opacity})")
 
 
-def generate_alerts(df, threshold=THRESHOLD_FALLBACK, ward_col='ward_id', prob_col='probability'):
+# Legacy utility - not wired in operational flow
+def generate_alerts(df, threshold=GLOBAL_THRESHOLD, ward_col='ward_id', prob_col='probability'):
     """
     Generate alert list for high-risk wards
     
@@ -84,10 +85,11 @@ def generate_alerts(df, threshold=THRESHOLD_FALLBACK, ward_col='ward_id', prob_c
     return high_risk_wards
 
 
+# Legacy utility - not wired in operational flow
 def generate_alert_message(
     ward_id,
     probability,
-    threshold=THRESHOLD_FALLBACK,
+    threshold=GLOBAL_THRESHOLD,
     action="Immediate Water Quality Intervention",
 ):
     """
@@ -110,7 +112,8 @@ def generate_alert_message(
     }
 
 
-def get_risk_summary(df, risk_col='risk'):
+# Legacy utility - not wired in operational flow
+def get_risk_summary(df, risk_col='risk_level'):
     """
     Get risk distribution summary
     
@@ -137,6 +140,7 @@ def get_risk_summary(df, risk_col='risk'):
     return summary
 
 
+# Legacy utility - not wired in operational flow
 def get_intervention_recommendations(risk_level, probability):
     """
     Get recommended interventions based on risk level
@@ -224,7 +228,8 @@ def _recommended_intervention(severity: str) -> str:
     return "Continue routine monitoring and data quality checks."
 
 
-def generate_alert_objects(predictions_df, threshold=THRESHOLD_FALLBACK, timeseries_df=None):
+# Legacy utility - not wired in operational flow
+def generate_alert_objects(predictions_df, threshold=GLOBAL_THRESHOLD, timeseries_df=None):
     high_risk = predictions_df[predictions_df['probability'] >= float(threshold)].copy()
     if len(high_risk) == 0:
         return []
