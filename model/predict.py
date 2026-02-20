@@ -25,6 +25,7 @@ class OutbreakPredictor:
         self.model_path = model_path
         self.model_metadata = {}
         self.is_loaded = False
+        self.latest_engineered = None
 
     @property
     def project_root(self):
@@ -157,6 +158,7 @@ class OutbreakPredictor:
         source_df = df if df is not None else self.load_latest_data(data_path)
         latest_df = self._prepare_latest_rows(source_df)
         validate_feature_schema(latest_df, self.feature_columns)
+        self.latest_engineered = latest_df
 
         probabilities = self.model.predict_proba(latest_df[self.feature_columns])[:, 1]
         probabilities = self._apply_probability_adjustment(probabilities)

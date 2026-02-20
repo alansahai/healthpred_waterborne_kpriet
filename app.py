@@ -11,6 +11,8 @@ from streamlit_folium import st_folium
 import plotly.graph_objects as go
 import os
 import numpy as np
+import json
+from datetime import datetime
 
 from model import OutbreakPredictor
 from utils import get_risk_color
@@ -120,6 +122,58 @@ def get_alert_status_color(alert_load: float):
         return "🔴", "Emergency"
 
 
+def get_prediction_history_path() -> str:
+    return os.path.join(os.path.dirname(__file__), 'data', 'prediction_history.json')
+
+
+def load_prediction_history() -> list:
+    history_path = get_prediction_history_path()
+    if not os.path.exists(history_path):
+        try:
+            with open(history_path, 'w', encoding='utf-8') as handle:
+                json.dump([], handle, indent=2)
+        except OSError:
+            return []
+        return []
+
+    try:
+        with open(history_path, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, list) else []
+    except (json.JSONDecodeError, OSError, TypeError):
+        return []
+
+
+def append_prediction_history_entry(current_date: str, high_risk_count: int, alert_load: float, alert_status: str):
+    history = load_prediction_history()
+    entry = {
+        'date': current_date,
+        'high_risk_wards': int(high_risk_count),
+        'alert_load_pct': round(float(alert_load) * 100.0, 2),
+        'alert_status': str(alert_status),
+    }
+
+    if history:
+        last = history[-1]
+        if (
+            last.get('date') == entry['date']
+            and int(last.get('high_risk_wards', -1)) == entry['high_risk_wards']
+            and float(last.get('alert_load_pct', -1)) == entry['alert_load_pct']
+            and str(last.get('alert_status', '')) == entry['alert_status']
+        ):
+            return history
+
+    history.append(entry)
+    history_path = get_prediction_history_path()
+    try:
+        with open(history_path, 'w', encoding='utf-8') as handle:
+            json.dump(history, handle, indent=2)
+    except OSError:
+        return history
+
+    return history
+
+
 def calculate_alert_load(predictions_df: pd.DataFrame, threshold: float) -> float:
     """Calculate percentage of wards above threshold"""
     if len(predictions_df) == 0:
@@ -160,6 +214,53 @@ def render_data_fusion_summary(data: pd.DataFrame):
     preview_cols = [col for col in preview_cols if col in data.columns]
     if preview_cols:
         st.dataframe(data[preview_cols].head(8), use_container_width=True, hide_index=True)
+
+
+def render_data_freshness_coverage_status(data: pd.DataFrame, data_loaded_at: datetime | None = None):
+    """Display latest-week freshness and ward coverage diagnostics."""
+    st.markdown("### Data Freshness & Coverage Status")
+
+    if data is None or len(data) == 0:
+        st.warning("Data Freshness & Coverage unavailable: dataset is empty.")
+        return
+
+    if 'week_start_date' not in data.columns:
+        st.warning("Data Freshness & Coverage unavailable: week_start_date column missing.")
+        return
+
+    working = data[['week_start_date']].copy()
+    working['week_start_date'] = pd.to_datetime(working['week_start_date'], errors='coerce')
+    if working['week_start_date'].isna().all():
+        st.warning("Data Freshness & Coverage unavailable: week_start_date values are invalid.")
+        return
+
+    latest_week = working['week_start_date'].max()
+    latest_mask = pd.to_datetime(data['week_start_date'], errors='coerce') == latest_week
+    latest_week_df = data.loc[latest_mask]
+
+    expected_wards = 100
+    if 'ward_id' in data.columns:
+        total_unique_wards = int(data['ward_id'].nunique())
+        if total_unique_wards > 0:
+            expected_wards = total_unique_wards
+
+    present_wards = int(latest_week_df['ward_id'].nunique()) if 'ward_id' in latest_week_df.columns else 0
+    missing_wards = max(0, expected_wards - present_wards)
+    completeness = (present_wards / expected_wards * 100.0) if expected_wards > 0 else 0.0
+    loaded_at_text = (
+        data_loaded_at.strftime('%Y-%m-%d %H:%M:%S')
+        if isinstance(data_loaded_at, datetime)
+        else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    )
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Latest Surveillance Week", latest_week.strftime('%Y-%m-%d'))
+    col2.metric("Ward Coverage", f"{present_wards} / {expected_wards}")
+    col3.metric("Missing Wards", missing_wards)
+
+    col4, col5 = st.columns(2)
+    col4.metric("Completeness", f"{completeness:.1f}%")
+    col5.metric("Data Loaded At", loaded_at_text)
 
 
 # =============================================================================
@@ -268,34 +369,112 @@ def integrate_data(health_df, water_df, rain_df):
 
 def get_contributing_factors(predictor, ward_data: pd.DataFrame) -> list:
     """
-    Extract top 3 contributing features for a ward's high risk prediction
-    Uses SHAP-inspired approach: checks feature values against thresholds
+    Extract top 3 contributing features for a ward's high risk prediction.
+    Uses rule-based scoring: raw feature values, trend signals (growth rates), 
+    and rolling averages without SHAP or heavy explainability.
     """
     try:
         if predictor is None or ward_data is None or len(ward_data) == 0:
             return []
         
-        # Key risk-driving features based on model training
-        risk_features = [
-            ('ecoli_index', 'E. coli contamination', lambda x: x > CONTRIBUTING_FACTOR_THRESHOLDS['ecoli_index']),
-            ('turbidity', 'Water turbidity', lambda x: x > CONTRIBUTING_FACTOR_THRESHOLDS['turbidity']),
-            ('rainfall_mm', 'High rainfall', lambda x: x > CONTRIBUTING_FACTOR_THRESHOLDS['rainfall_mm']),
-            ('reported_cases', 'Rising disease cases', lambda x: x > CONTRIBUTING_FACTOR_THRESHOLDS['reported_cases']),
-            ('monsoon_flag', 'Monsoon season', lambda x: x == CONTRIBUTING_FACTOR_THRESHOLDS['monsoon_flag']),
-        ]
+        row = ward_data.iloc[0]
+        signals = []
         
-        contributing = []
-        for col_name, description, threshold_func in risk_features:
-            if col_name in ward_data.columns:
-                value = ward_data[col_name].iloc[0]
-                if pd.notna(value) and threshold_func(value):
-                    contributing.append({
-                        'feature': description,
-                        'value': value,
-                        'severity': 'High' if value > (100 if col_name != 'monsoon_flag' else 0) else 'Moderate'
-                    })
+        # SIGNAL 1: E. coli contamination (raw + trend)
+        if 'ecoli_index' in ward_data.columns and pd.notna(row['ecoli_index']):
+            ecoli_val = row['ecoli_index']
+            ecoli_avg_col = 'ecoli_2w_avg'
+            ecoli_growth = None
+            if ecoli_avg_col in ward_data.columns:
+                avg = row.get(ecoli_avg_col, None)
+                if pd.notna(avg):
+                    ecoli_growth = ecoli_val - avg if pd.notna(avg) else None
+            
+            threshold = CONTRIBUTING_FACTOR_THRESHOLDS['ecoli_index']
+            if ecoli_val > threshold or (ecoli_growth and ecoli_growth > 0.5):
+                severity = 'High' if ecoli_val > threshold * 1.5 else 'Moderate'
+                detail = 'Spike detected' if ecoli_growth and ecoli_growth > 0.5 else 'Elevated'
+                signals.append({
+                    'feature': 'E. coli contamination',
+                    'value': ecoli_val,
+                    'detail': detail,
+                    'severity': severity,
+                    'score': ecoli_val + (ecoli_growth if ecoli_growth and ecoli_growth > 0 else 0)
+                })
         
-        return sorted(contributing, key=lambda x: (x['severity'] == 'Moderate'), reverse=False)[:3]
+        # SIGNAL 2: Rainfall spike (raw + trend)
+        if 'rainfall_mm' in ward_data.columns and pd.notna(row['rainfall_mm']):
+            rainfall_val = row['rainfall_mm']
+            rainfall_avg_col = 'rainfall_2w_avg'
+            rainfall_growth = None
+            if rainfall_avg_col in ward_data.columns:
+                avg = row.get(rainfall_avg_col, None)
+                if pd.notna(avg):
+                    rainfall_growth = rainfall_val - avg if pd.notna(avg) else None
+            
+            threshold = CONTRIBUTING_FACTOR_THRESHOLDS['rainfall_mm']
+            if rainfall_val > threshold or (rainfall_growth and rainfall_growth > 10):
+                severity = 'High' if rainfall_val > threshold * 1.5 else 'Moderate'
+                detail = 'Sharp spike' if rainfall_growth and rainfall_growth > 10 else 'Above normal'
+                signals.append({
+                    'feature': 'Rainfall spike',
+                    'value': rainfall_val,
+                    'detail': detail,
+                    'severity': severity,
+                    'score': rainfall_val + (rainfall_growth if rainfall_growth and rainfall_growth > 0 else 0)
+                })
+        
+        # SIGNAL 3: Rising case trend (growth rate + rolling avg)
+        if 'reported_cases' in ward_data.columns and pd.notna(row['reported_cases']):
+            cases_val = row['reported_cases']
+            cases_avg_col = 'cases_2w_avg'
+            cases_growth = None
+            if cases_avg_col in ward_data.columns:
+                avg = row.get(cases_avg_col, None)
+                if pd.notna(avg) and avg > 0:
+                    cases_growth = (cases_val - avg) / avg if pd.notna(avg) else None
+            
+            threshold = CONTRIBUTING_FACTOR_THRESHOLDS['reported_cases']
+            if cases_val > threshold or (cases_growth and cases_growth > 0.15):
+                severity = 'High' if cases_val > threshold * 1.5 else 'Moderate'
+                detail = 'Rising trend detected' if cases_growth and cases_growth > 0.15 else 'Elevated count'
+                signals.append({
+                    'feature': 'Rising case trend',
+                    'value': cases_val,
+                    'detail': detail,
+                    'severity': severity,
+                    'score': cases_val + (cases_growth * 100 if cases_growth and cases_growth > 0 else 0)
+                })
+        
+        # SIGNAL 4: Water turbidity
+        if 'turbidity' in ward_data.columns and pd.notna(row['turbidity']):
+            turbidity_val = row['turbidity']
+            threshold = CONTRIBUTING_FACTOR_THRESHOLDS['turbidity']
+            if turbidity_val > threshold:
+                severity = 'High' if turbidity_val > threshold * 1.5 else 'Moderate'
+                signals.append({
+                    'feature': 'High turbidity',
+                    'value': turbidity_val,
+                    'detail': 'Water clarity compromised',
+                    'severity': severity,
+                    'score': turbidity_val
+                })
+        
+        # SIGNAL 5: Monsoon season
+        if 'monsoon_flag' in ward_data.columns and pd.notna(row['monsoon_flag']):
+            if row['monsoon_flag'] == CONTRIBUTING_FACTOR_THRESHOLDS['monsoon_flag']:
+                signals.append({
+                    'feature': 'Monsoon season',
+                    'value': 1.0,
+                    'detail': 'Peak outbreak risk window',
+                    'severity': 'Moderate',
+                    'score': 50  # Monsoon always scores moderate
+                })
+        
+        # Sort by severity (High first) then by score (descending) and return top 3
+        signals = sorted(signals, key=lambda x: (x['severity'] != 'High', -x['score']))[:3]
+        
+        return signals
     except (KeyError, ValueError, TypeError, IndexError):
         return []
 
@@ -518,6 +697,7 @@ def page_operational_monitoring():
     data = None
     predictions = None
     model_metadata = None
+    data_loaded_at = None
     error_occurred = False
 
     with st.spinner("⏳ Loading trained model..."):
@@ -536,6 +716,7 @@ def page_operational_monitoring():
                 data, error = load_data(data_path)
                 if error:
                     raise ValueError(f"Data load failed: {error}")
+                data_loaded_at = datetime.now()
             except (FileNotFoundError, ValueError, pd.errors.ParserError, OSError) as e:
                 st.error(f"❌ Cannot load data: {str(e)}")
                 error_occurred = True
@@ -543,6 +724,8 @@ def page_operational_monitoring():
     if not error_occurred and predictor and data is not None:
         st.markdown("---")
         render_data_fusion_summary(data)
+        st.markdown("---")
+        render_data_freshness_coverage_status(data, data_loaded_at=data_loaded_at)
 
         # ===================================================================
         # DATA QUALITY MONITOR (Before Predictions)
@@ -576,17 +759,21 @@ def page_operational_monitoring():
         if cache_hit:
             predictions = st.session_state['operational_predictions_cache']
             model_metadata = st.session_state['operational_model_metadata_cache']
+            engineered_df = st.session_state.get('operational_engineered_cache')
         else:
             with st.spinner("⏳ Generating predictions..."):
                 try:
                     predictions = predictor.predict_latest_week(df=data)
                     model_metadata = predictor.get_model_metadata()
+                    engineered_df = predictor.latest_engineered
                     st.session_state['operational_prediction_signature'] = data_signature
                     st.session_state['operational_predictions_cache'] = predictions
                     st.session_state['operational_model_metadata_cache'] = model_metadata
+                    st.session_state['operational_engineered_cache'] = engineered_df
                 except (ValueError, KeyError, TypeError, RuntimeError) as e:
                     st.error(f"❌ Prediction failed: {str(e)}")
                     error_occurred = True
+                    engineered_df = None
 
         # ===================================================================
         # SIDEBAR: WHAT-IF RISK SIMULATOR
@@ -827,8 +1014,8 @@ def page_operational_monitoring():
                 
                 # RISK RESPONSE PANEL (Expandable)
                 with st.expander(f"🔴 **Risk Response Panel** — {row['ward_id']}", expanded=False):
-                    # Get contributing factors
-                    ward_row = data[data['ward_id'] == row['ward_id']]
+                    # Get contributing factors (use engineered features if available, fallback to raw data)
+                    ward_row = engineered_df[engineered_df['ward_id'] == row['ward_id']] if engineered_df is not None else data[data['ward_id'] == row['ward_id']]
                     contributing = get_contributing_factors(predictor, ward_row)
                     
                     col1, col2 = st.columns([1.5, 1.5])
@@ -839,7 +1026,7 @@ def page_operational_monitoring():
                             for i, factor in enumerate(contributing, 1):
                                 severity_emoji = "🔴" if factor['severity'] == 'High' else "🟡"
                                 st.write(f"{severity_emoji} **{i}. {factor['feature']}**")
-                                st.caption(f"   Value: {factor['value']:.1f}")
+                                st.caption(f"   {factor['detail']} | Value: {factor['value']:.1f}")
                         else:
                             st.info("No major contributing factors detected")
                     
@@ -915,6 +1102,59 @@ def page_operational_monitoring():
         col3.metric("🟡 Moderate Risk", risk_counts.get('Moderate', 0))
         col4.metric("🔴 High Risk", risk_counts.get('High', 0))
         col5.metric("Alert Load", f"{alert_load:.1%}")
+
+        # ===================================================================
+        # PREDICTION HISTORY TRACKING + TREND
+        # ===================================================================
+
+        current_date = datetime.now().date().isoformat()
+        history_signature = (
+            current_date,
+            int(len(high_risk)),
+            round(float(alert_load), 6),
+            str(status_text),
+        )
+
+        history_data = load_prediction_history()
+        if st.session_state.get('prediction_history_signature') != history_signature:
+            history_data = append_prediction_history_entry(
+                current_date=current_date,
+                high_risk_count=len(high_risk),
+                alert_load=alert_load,
+                alert_status=status_text,
+            )
+            st.session_state['prediction_history_signature'] = history_signature
+
+        st.markdown("---")
+        st.markdown("### District Alert Trend (Historical)")
+        if history_data:
+            history_df = pd.DataFrame(history_data)
+            if 'date' in history_df.columns:
+                history_df['date'] = pd.to_datetime(history_df['date'], errors='coerce')
+                history_df = history_df.dropna(subset=['date']).sort_values('date')
+                history_df = history_df.set_index('date')
+
+                if len(history_df) >= 2:
+                    col_hist_1, col_hist_2 = st.columns(2)
+                    with col_hist_1:
+                        st.caption("High-risk wards over time")
+                        st.line_chart(history_df['high_risk_wards'])
+                    with col_hist_2:
+                        st.caption("Alert load percentage over time")
+                        st.line_chart(history_df['alert_load_pct'])
+                elif len(history_df) == 1:
+                    st.info("📊 Trend data will accumulate over multiple prediction cycles. Current history: 1 entry. Check back after next operational cycle.")
+                    col_hist_1, col_hist_2 = st.columns(2)
+                    with col_hist_1:
+                        st.metric("Current High-Risk Wards", f"{int(history_df['high_risk_wards'].iloc[0])}")
+                    with col_hist_2:
+                        st.metric("Current Alert Load", f"{history_df['alert_load_pct'].iloc[0]:.1f}%")
+                else:
+                    st.info("No valid history entries available yet.")
+            else:
+                st.warning("History data format issue: missing 'date' column.")
+        else:
+            st.info("📊 No prediction history available yet. History tracking will begin after the first prediction run.")
 
         # ===================================================================
         # INTERACTIVE RISK HEATMAP - ALL WARDS RENDERED
@@ -1718,6 +1958,20 @@ def page_environmental_analysis():
             
             st.plotly_chart(fig_heatmap, use_container_width=True)
             
+            # Correlation analysis basis
+            corr_sample_size = len(data)
+            date_range_start = pd.to_datetime(data['week_start_date']).min() if 'week_start_date' in data.columns else None
+            date_range_end = pd.to_datetime(data['week_start_date']).max() if 'week_start_date' in data.columns else None
+            date_range_text = f"{date_range_start.strftime('%Y-%m-%d')} to {date_range_end.strftime('%Y-%m-%d')}" if date_range_start and date_range_end else "Unknown"
+            
+            st.markdown("#### Correlation Analysis Basis:")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Sample Size", f"{corr_sample_size:,} week-ward observations")
+            col2.metric("Time Period", date_range_text if len(date_range_text) < 25 else f"{corr_sample_size} records")
+            col3.metric("Method", "Pearson Correlation")
+            
+            st.caption(f"Correlation computed across {corr_sample_size:,} integrated surveillance records covering {date_range_text}. Each observation represents weekly aggregated metrics per ward. Positive correlations indicate factors that rise together with disease cases; negative correlations indicate inverse relationships.")
+            
             # Interpretation
             st.markdown("#### Key Correlations:")
             
@@ -1740,8 +1994,12 @@ def page_environmental_analysis():
             if cases_col is None:
                 st.warning("Cases column not available for seasonal analysis")
             else:
-                monthly_cases = data_copy.groupby('month_name')[cases_col].mean().reset_index()
-                monthly_rainfall = data_copy.groupby('month_name')['rainfall_mm'].mean().reset_index()
+                # Group by month and sort chronologically
+                monthly_cases = data_copy.groupby(['month', 'month_name'])[cases_col].mean().reset_index()
+                monthly_cases = monthly_cases.sort_values('month')
+                
+                monthly_rainfall = data_copy.groupby(['month', 'month_name'])['rainfall_mm'].mean().reset_index()
+                monthly_rainfall = monthly_rainfall.sort_values('month')
             
                 col1, col2 = st.columns(2)
 
@@ -1758,7 +2016,8 @@ def page_environmental_analysis():
                         title="Average Cases by Month",
                         xaxis_title="Month",
                         yaxis_title="Cases",
-                        height=300
+                        height=300,
+                        xaxis=dict(categoryorder='array', categoryarray=monthly_cases['month_name'].tolist())
                     )
                     st.plotly_chart(fig_monthly_cases, use_container_width=True)
 
@@ -1775,7 +2034,8 @@ def page_environmental_analysis():
                         title="Average Rainfall by Month",
                         xaxis_title="Month",
                         yaxis_title="Rainfall (mm)",
-                        height=300
+                        height=300,
+                        xaxis=dict(categoryorder='array', categoryarray=monthly_rainfall['month_name'].tolist())
                     )
                     st.plotly_chart(fig_monthly_rain, use_container_width=True)
 
@@ -1832,6 +2092,32 @@ def page_data_integration():
     **Multi-Source Data Integration** — Consolidate health surveillance, water quality, and rainfall data  
     Addresses: Lack of integration between water quality data and health surveillance systems
     """)
+    
+    st.markdown("---")
+    
+    # Load and display default integrated dataset
+    st.subheader("📊 Current Integrated Dataset")
+    try:
+        data_path = resolve_default_data_path()
+        integrated_ds, error = load_data(data_path)
+        if integrated_ds is not None and len(integrated_ds) > 0:
+            col1, col2, col3 = st.columns(3)
+            col1.metric("📊 Total Rows", f"{len(integrated_ds):,}")
+            col2.metric("📍 Unique Wards", f"{integrated_ds['ward_id'].nunique()}")
+            col3.metric("📅 Weeks Covered", f"{integrated_ds['week_start_date'].nunique() if 'week_start_date' in integrated_ds.columns else 'N/A'}")
+            
+            st.markdown("#### Preview (First 20 Rows)")
+            display_cols = ['week_start_date', 'ward_id', 'reported_cases', 'turbidity', 'ecoli_index', 'rainfall_mm']
+            display_cols = [col for col in display_cols if col in integrated_ds.columns]
+            st.dataframe(
+                integrated_ds[display_cols].head(20),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.warning("Could not load integrated dataset.")
+    except Exception as e:
+        st.warning(f"Could not load integrated dataset: {str(e)}")
     
     st.markdown("---")
     st.subheader("📥 Data Source Configuration")

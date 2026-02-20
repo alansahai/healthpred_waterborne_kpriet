@@ -30,6 +30,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from xgboost import XGBClassifier
 
 from utils.feature_engineering import engineer_outbreak_features, get_model_feature_columns
+from utils.constants import GLOBAL_THRESHOLD
 
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
@@ -74,7 +75,7 @@ class DatasetSummary:
 class ProductionPipelineV3:
     def __init__(self) -> None:
         self.feature_columns = get_model_feature_columns()
-        self.global_threshold = 0.5
+        self.global_threshold = float(GLOBAL_THRESHOLD)
         self.best_params: Dict[str, float] = {}
         self.calibration_obj: Dict[str, object] = {"method": "none"}
         self.cv_metrics: Dict[str, object] = {}
@@ -418,7 +419,7 @@ class ProductionPipelineV3:
         f1s = np.array([record["f1"] for record in valid_folds], dtype=float)
         rocs = np.array([record["roc_auc"] for record in valid_folds], dtype=float)
 
-        self.global_threshold = float(np.mean(best_bundle["fold_thresholds"])) if best_bundle["fold_thresholds"] else 0.5
+        self.global_threshold = float(GLOBAL_THRESHOLD)
         self.best_params = dict(best_bundle["params"])
         self.cv_metrics = {
             "fold_metrics": best_bundle["fold_metrics"],
