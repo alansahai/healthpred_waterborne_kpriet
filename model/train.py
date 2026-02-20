@@ -27,6 +27,7 @@ from utils.feature_engineering import (
 )
 from utils.runtime_config import load_runtime_config
 from utils.constants import (
+    GLOBAL_THRESHOLD,
     SELECTION_F1_WEIGHT,
     SELECTION_RECALL_WEIGHT,
     THRESHOLD_FALLBACK,
@@ -248,7 +249,7 @@ class OutbreakModelTrainer:
                     'fitted_on': 'oof_cv',
                 }
                 return
-            except Exception:
+            except (ValueError, TypeError, RuntimeError):
                 pass
 
         alpha = 0.1
@@ -381,6 +382,11 @@ class OutbreakModelTrainer:
         }
 
     def _bundle_score(self, fold_metrics):
+        """Score bundles with recall-weighted emphasis for early warning system.
+        
+        For outbreak prediction, recall (catching real outbreaks) is critical.
+        We weight: Recall 50%, ROC-AUC 30%, F1 20% to emphasize sensitivity.
+        """
         valid = [fold for fold in fold_metrics if not fold.get('skipped', False)]
         if not valid:
             return -np.inf
@@ -388,10 +394,15 @@ class OutbreakModelTrainer:
         scores = []
         for fold in valid:
             roc_auc = fold.get('roc_auc', np.nan)
+            # Use fold's ROC-AUC, with fallback pivot value if NaN
             roc_component = 0.5 if pd.isna(roc_auc) else float(roc_auc)
             recall_component = float(fold.get('recall', 0.0))
             f1_component = float(fold.get('f1_score', 0.0))
-            scores.append((0.5 * roc_component) + (0.3 * recall_component) + (0.2 * f1_component))
+            
+            # Recall-weighted bundle: 50% Recall, 30% ROC-AUC, 20% F1
+            bundle = (0.5 * recall_component) + (0.3 * roc_component) + (0.2 * f1_component)
+            scores.append(bundle)
+        
         return float(np.mean(scores))
 
     def _build_feature_set_candidates(self):
@@ -420,17 +431,34 @@ class OutbreakModelTrainer:
         if target_col in training_df.columns:
             raw_target = pd.to_numeric(training_df[target_col], errors='coerce').fillna(0)
             raw_target = (raw_target > 0).astype(int)
-            print("Raw target distribution: df['outbreak_next_week'].value_counts(normalize=True)")
-            print(raw_target.value_counts(normalize=True))
 
         prepared = self.prepare_data(training_df, target_col=target_col)
         engineered = prepared['engineered']
         folds = self._build_time_folds(engineered, n_splits=5)
 
+        # Expanded hyperparameter search space for better recall/ROC-AUC
         param_grid = [
+            # Shallow trees with higher learning rate (balanced approach)
             {'max_depth': 3, 'learning_rate': 0.05, 'n_estimators': 220, 'min_child_weight': 2, 'reg_lambda': 1.0, 'subsample': 0.9, 'colsample_bytree': 0.9},
+            {'max_depth': 3, 'learning_rate': 0.08, 'n_estimators': 180, 'min_child_weight': 1, 'reg_lambda': 0.5, 'subsample': 0.95, 'colsample_bytree': 0.95},
+            
+            # Medium depth trees (good interpretability + performance)
             {'max_depth': 4, 'learning_rate': 0.04, 'n_estimators': 300, 'min_child_weight': 3, 'reg_lambda': 1.5, 'subsample': 0.85, 'colsample_bytree': 0.85},
+            {'max_depth': 4, 'learning_rate': 0.06, 'n_estimators': 250, 'min_child_weight': 2, 'reg_lambda': 1.0, 'subsample': 0.9, 'colsample_bytree': 0.9},
+            
+            # Medium-deep trees (more capacity for complex patterns)
             {'max_depth': 5, 'learning_rate': 0.03, 'n_estimators': 360, 'min_child_weight': 3, 'reg_lambda': 2.0, 'subsample': 0.8, 'colsample_bytree': 0.8},
+            {'max_depth': 5, 'learning_rate': 0.05, 'n_estimators': 280, 'min_child_weight': 2, 'reg_lambda': 1.5, 'subsample': 0.85, 'colsample_bytree': 0.85},
+            
+            # Deeper trees (more capacity, higher regularization)
+            {'max_depth': 6, 'learning_rate': 0.02, 'n_estimators': 400, 'min_child_weight': 4, 'reg_lambda': 2.5, 'subsample': 0.75, 'colsample_bytree': 0.75},
+            {'max_depth': 6, 'learning_rate': 0.04, 'n_estimators': 320, 'min_child_weight': 3, 'reg_lambda': 2.0, 'subsample': 0.8, 'colsample_bytree': 0.8},
+            
+            # Very low learning rate with more estimators (slow burn)
+            {'max_depth': 4, 'learning_rate': 0.01, 'n_estimators': 500, 'min_child_weight': 2, 'reg_lambda': 0.8, 'subsample': 0.9, 'colsample_bytree': 0.9},
+            
+            # Aggressive with regularization (prevent overfitting)
+            {'max_depth': 3, 'learning_rate': 0.1, 'n_estimators': 150, 'min_child_weight': 3, 'reg_lambda': 3.0, 'subsample': 0.7, 'colsample_bytree': 0.7},
         ]
 
         best_bundle = None
@@ -441,10 +469,6 @@ class OutbreakModelTrainer:
             self.feature_columns = feature_candidate['columns']
             for params in param_grid:
                 candidate_counter += 1
-                print(
-                    f"CV Search {candidate_counter}/{total_candidates} | "
-                    f"feature_set={feature_candidate['name']} | params={params}"
-                )
                 bundle = self._evaluate_param_with_cv(engineered, folds, params, target_col=target_col)
                 bundle['feature_set_name'] = feature_candidate['name']
                 bundle['feature_columns'] = list(feature_candidate['columns'])
@@ -465,7 +489,7 @@ class OutbreakModelTrainer:
 
         self.best_params = best_bundle['params']
         self.feature_columns = best_bundle['feature_columns']
-        self.best_threshold = float(np.mean(best_bundle['fold_thresholds'])) if best_bundle['fold_thresholds'] else THRESHOLD_FALLBACK
+        self.best_threshold = float(GLOBAL_THRESHOLD)
 
         oof_df = best_bundle['oof_predictions'].sort_values('row_index').reset_index(drop=True)
         y_oof = oof_df['y_true'].to_numpy(dtype=int)
@@ -569,36 +593,6 @@ class OutbreakModelTrainer:
 
         self.save_model()
 
-        print("\n" + "=" * 60)
-        print("OUTBREAK MODEL TRAINING RESULTS - ROLLING CV")
-        print("=" * 60)
-        print(f"Selected feature set: {best_bundle.get('feature_set_name')}")
-        print(f"Selected params: {self.best_params}")
-        print(f"Bundle score (ROC/Recall/F1 blended): {best_bundle.get('bundle_score'):.4f}")
-        print("Fold-wise metrics:")
-        for fold in fold_metrics:
-            if fold.get('skipped', False):
-                print(f"Fold {fold['fold_id']}: SKIPPED ({fold['reason']})")
-                continue
-            print(
-                f"Fold {fold['fold_id']} [{fold['validation_start']} → {fold['validation_end']}] | "
-                f"Recall={fold['recall']:.2%}, F1={fold['f1_score']:.2%}, ROC-AUC={fold['roc_auc']:.4f}, "
-                f"Threshold={fold['best_threshold']:.2f}"
-            )
-
-        print("\nMean CV metrics:")
-        print(f"Recall  : {cv_metrics['recall_mean']:.2%} ± {cv_metrics['recall_std']:.2%}")
-        print(f"F1      : {cv_metrics['f1_mean']:.2%} ± {cv_metrics['f1_std']:.2%}")
-        if pd.notna(cv_metrics['roc_auc_mean']):
-            print(f"ROC-AUC : {cv_metrics['roc_auc_mean']:.4f} ± {cv_metrics['roc_auc_std']:.4f}")
-        else:
-            print("ROC-AUC : N/A")
-
-        print(f"\nGlobal threshold (mean fold threshold): {self.best_threshold:.2f}")
-        print("Final model trained on full dataset: YES")
-        print("Calibration fitted on out-of-fold predictions: YES")
-        print("=" * 60 + "\n")
-
         return self.metrics
 
     def save_model(self):
@@ -691,5 +685,5 @@ class OutbreakModelTrainer:
                 {'feature': self.feature_columns, 'shap_importance': mean_shap}
             ).sort_values('shap_importance', ascending=False).head(top_n)
             return shap_values, shap_importance_df
-        except Exception:
+        except (ValueError, TypeError, RuntimeError):
             return None, self.get_feature_importance(top_n)

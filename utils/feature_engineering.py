@@ -49,6 +49,14 @@ def prepare_outbreak_data(df: pd.DataFrame, require_target: bool = True) -> pd.D
         preview = invalid_values[:5]
         raise ValueError(f"Invalid ward_id values detected: {preview}")
 
+    duplicate_mask = data.duplicated(subset=[WARD_ID_COL, WEEK_START_DATE_COL], keep=False)
+    if duplicate_mask.any():
+        duplicate_rows = data.loc[duplicate_mask, [WARD_ID_COL, WEEK_START_DATE_COL]].head(10)
+        raise ValueError(
+            "Duplicate (ward_id, week_start_date) rows detected before feature engineering: "
+            f"{duplicate_rows.to_dict(orient='records')}"
+        )
+
     numeric_columns = [RAINFALL_COL, TURBIDITY_COL, ECOLI_COL, REPORTED_CASES_COL]
     for column in numeric_columns:
         data[column] = pd.to_numeric(data[column], errors='coerce')
@@ -72,24 +80,70 @@ def engineer_outbreak_features(
     data = prepare_outbreak_data(df, require_target=require_target)
     grouped = data.groupby(WARD_ID_COL, group_keys=False)
 
+    # ===== LAG FEATURES (1-week, 2-week) =====
     data['cases_last_week'] = grouped[REPORTED_CASES_COL].shift(1)
     data['cases_last_2_weeks'] = grouped[REPORTED_CASES_COL].shift(2)
     data['rainfall_last_week'] = grouped[RAINFALL_COL].shift(1)
+    data['turbidity_last_week'] = grouped[TURBIDITY_COL].shift(1)
     data['ecoli_last_week'] = grouped[ECOLI_COL].shift(1)
 
+    # ===== ROLLING AVERAGES (2-week and 3-week) =====
     data['rainfall_2w_avg'] = grouped[RAINFALL_COL].transform(
         lambda values: values.shift(1).rolling(window=2, min_periods=2).mean()
+    )
+    data['rainfall_3w_avg'] = grouped[RAINFALL_COL].transform(
+        lambda values: values.shift(1).rolling(window=3, min_periods=3).mean()
     )
     data['cases_2w_avg'] = grouped[REPORTED_CASES_COL].transform(
         lambda values: values.shift(1).rolling(window=2, min_periods=2).mean()
     )
+    data['cases_3w_avg'] = grouped[REPORTED_CASES_COL].transform(
+        lambda values: values.shift(1).rolling(window=3, min_periods=3).mean()
+    )
+    data['ecoli_2w_avg'] = grouped[ECOLI_COL].transform(
+        lambda values: values.shift(1).rolling(window=2, min_periods=2).mean()
+    )
+    data['turbidity_2w_avg'] = grouped[TURBIDITY_COL].transform(
+        lambda values: values.shift(1).rolling(window=2, min_periods=2).mean()
+    )
 
+    # ===== GROWTH RATES (acceleration) =====
+    # Case growth rate: (current - last week) / last week
     previous_cases = data['cases_last_week'].replace(0, np.nan)
     data['case_growth_rate'] = (data[REPORTED_CASES_COL] - data['cases_last_week']) / previous_cases
     data['case_growth_rate'] = data['case_growth_rate'].replace([np.inf, -np.inf], np.nan)
 
-    data['rainfall_ecoli_interaction'] = data[RAINFALL_COL] * data[ECOLI_COL]
+    # Rainfall acceleration: (current - last week) / (last week + 1 to avoid division by zero)
+    rainfall_accel = (data[RAINFALL_COL] - data['rainfall_last_week']) / (data['rainfall_last_week'] + 1.0)
+    data['rainfall_acceleration'] = rainfall_accel.replace([np.inf, -np.inf], np.nan)
 
+    # Contamination growth rate: change in ecoli levels
+    previous_ecoli = data['ecoli_last_week'].replace(0, np.nan)
+    data['contamination_growth_rate'] = (data[ECOLI_COL] - data['ecoli_last_week']) / (previous_ecoli + 0.1)
+    data['contamination_growth_rate'] = data['contamination_growth_rate'].replace([np.inf, -np.inf], np.nan)
+
+    # Turbidity growth rate
+    previous_turbidity = data['turbidity_last_week'].replace(0, np.nan)
+    data['turbidity_growth_rate'] = (data[TURBIDITY_COL] - data['turbidity_last_week']) / (previous_turbidity + 0.1)
+    data['turbidity_growth_rate'] = data['turbidity_growth_rate'].replace([np.inf, -np.inf], np.nan)
+
+    # ===== INTERACTION FEATURES =====
+    data['rainfall_ecoli_interaction'] = data[RAINFALL_COL] * data[ECOLI_COL]
+    data['rainfall_2w_avg_turbidity_interaction'] = data['rainfall_2w_avg'] * data[TURBIDITY_COL]
+    data['rainfall_3w_avg_ecoli_interaction'] = data['rainfall_3w_avg'] * data[ECOLI_COL]
+
+    # ===== PAST OUTBREAK INDICATOR =====
+    # Flag if outbreak occurred in previous week
+    data['outbreak_last_week'] = grouped[TARGET_COL].shift(1) if require_target else 0
+    # Create a rolling count of outbreaks in past 2 weeks
+    if require_target:
+        data['outbreak_count_2w'] = grouped[TARGET_COL].transform(
+            lambda values: values.shift(1).rolling(window=2, min_periods=1).sum()
+        )
+    else:
+        data['outbreak_count_2w'] = 0
+
+    # ===== TEMPORAL FEATURES =====
     data['month'] = data[WEEK_START_DATE_COL].dt.month
     data['iso_week'] = data[WEEK_START_DATE_COL].dt.isocalendar().week.astype(int)
     data['monsoon_flag'] = data['month'].isin([6, 7, 8, 9, 10, 11]).astype(int)
@@ -99,10 +153,18 @@ def engineer_outbreak_features(
             'cases_last_week',
             'cases_last_2_weeks',
             'rainfall_last_week',
+            'turbidity_last_week',
             'ecoli_last_week',
             'rainfall_2w_avg',
+            'rainfall_3w_avg',
             'cases_2w_avg',
+            'cases_3w_avg',
+            'ecoli_2w_avg',
+            'turbidity_2w_avg',
             'case_growth_rate',
+            'rainfall_acceleration',
+            'contamination_growth_rate',
+            'turbidity_growth_rate',
         ]
         data = data.dropna(subset=required_lag_cols).reset_index(drop=True)
     else:
@@ -114,18 +176,34 @@ def engineer_outbreak_features(
 def get_model_feature_columns() -> list:
     """Return feature list used consistently for training and inference."""
     return [
+        # Raw environmental features
         'rainfall_mm',
         'turbidity',
         'ecoli_index',
         'reported_cases',
+        # Lag features (1-week, 2-week)
         'cases_last_week',
         'cases_last_2_weeks',
         'rainfall_last_week',
+        'turbidity_last_week',
         'ecoli_last_week',
+        # Rolling averages (2-week and 3-week)
         'rainfall_2w_avg',
+        'rainfall_3w_avg',
         'cases_2w_avg',
+        'cases_3w_avg',
+        'ecoli_2w_avg',
+        'turbidity_2w_avg',
+        # Growth rates and acceleration
         'case_growth_rate',
+        'rainfall_acceleration',
+        'contamination_growth_rate',
+        'turbidity_growth_rate',
+        # Interaction features
         'rainfall_ecoli_interaction',
+        'rainfall_2w_avg_turbidity_interaction',
+        'rainfall_3w_avg_ecoli_interaction',
+        # Temporal features
         'month',
         'iso_week',
         'monsoon_flag',

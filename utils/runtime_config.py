@@ -5,13 +5,13 @@ import os
 from typing import Any, Dict
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "data_path": "data/coimbatore_weekly_water_disease_2024.csv",
-    "model_path": "model/outbreak_model.pkl",
+    "data_path": "data/integrated_surveillance_dataset_final.csv",
+    "model_path": "model/final_outbreak_model_v3.pkl",
     "threshold_override": None,
     "retraining_frequency_days": 30,
     "forward_prediction_days": 7,
     "enable_14_day_projection": True,
-    "artifact_version": "2.1.0-operational",
+    "artifact_version": "3.0-final",
     "display_low_cutoff": 0.15,
     "display_high_cutoff": 0.30,
     "safe_state_message": "No outbreak risk above configured threshold for the next 7 days.",
@@ -44,8 +44,7 @@ def load_runtime_config() -> Dict[str, Any]:
         config["data_path"] = os.getenv("HP_DATA_PATH")
     if os.getenv("HP_MODEL_PATH"):
         config["model_path"] = os.getenv("HP_MODEL_PATH")
-    if os.getenv("HP_THRESHOLD_OVERRIDE"):
-        config["threshold_override"] = float(os.getenv("HP_THRESHOLD_OVERRIDE"))
+    # Threshold override is intentionally ignored in strict operational mode.
     if os.getenv("HP_RETRAIN_FREQUENCY_DAYS"):
         config["retraining_frequency_days"] = int(os.getenv("HP_RETRAIN_FREQUENCY_DAYS"))
     if os.getenv("HP_ENABLE_14_DAY_PROJECTION"):

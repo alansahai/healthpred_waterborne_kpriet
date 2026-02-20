@@ -37,9 +37,9 @@ health_prediction_poc/
 │   ├── geo_mapping.py              # Ward-to-zone mapping
 │   └── analytics.py                # Correlation analysis
 ├── data/
-│   ├── sample_data.csv
-│   ├── sample_unified_master_dataset.csv
-│   └── coimbatore_weekly_water_disease_2024.csv
+│   ├── integrated_surveillance_dataset_final.csv
+│   ├── integrated_surveillance_dataset.csv
+│   └── coimbatore_unified_master_dataset_with_zone.csv
 ├── geo/
 │   └── coimbatore.geojson          # Zone boundaries
 ├── requirements.txt
@@ -111,12 +111,25 @@ Runtime config file: `config/system_config.json`
 
 - `data_path`: predefined ingestion CSV path
 - `model_path`: persisted model artifact path
-- `threshold_override`: override decision threshold (optional)
+- `threshold_override`: reserved field; ignored in strict operational mode
 - `retraining_frequency_days`: governance for retraining cadence
 - `artifact_version`: model artifact version tracking
 - `enable_14_day_projection`: toggle recursive week +2 projection
 
 The architecture is ready to integrate real-time data APIs without structural changes.
+
+### 🔒 Operational Hardening (Implemented)
+
+- **Frozen artifact lock:** Operational mode hard-fails if `model/final_outbreak_model_v3.pkl` is missing.
+- **No silent model fallback:** No secondary model artifact is loaded in operational startup.
+- **Strict metadata contract:** Artifact metadata is validated for required keys (`threshold`, `calibration`, `training_range`, `cv_metrics`, `artifact_version`).
+- **Policy threshold guard:** Startup asserts deployment threshold equals `0.23`.
+- **Data integrity checks:** Duplicate `(ward_id, week_start_date)` records raise errors before feature engineering.
+- **Merge row integrity:** Integration validates expected rows (`expected_wards * expected_weeks`) and fails on mismatch.
+- **What-if scope safety:** Scenario edits apply only to selected ward on the latest week row.
+- **Admin-only retraining:** Retraining is manual from Administration page and writes to `model/final_outbreak_model_v3.pkl`.
+- **Rerun efficiency:** Model loading uses `@st.cache_resource`; dataset loading uses `@st.cache_data`.
+- **Clean runtime output:** Debug-style `print(...)` traces removed from training/finalization runtime paths.
 
 ---
 
@@ -135,7 +148,7 @@ The architecture is ready to integrate real-time data APIs without structural ch
 | **Accuracy** | 82% | Overall correctness |
 
 ### Feature Engineering Pipeline
-- **Temporal Features:** Lag (1, 2, 4 weeks), rolling averages, growth rates
+- **Temporal Features:** Lag (1, 2 weeks), rolling averages, growth rates
 - **Environmental:** Rainfall, water quality, sanitation indices
 - **Statistical:** Ward-level min/max/median history
 - **Interactions:** Water quality × sanitation, rainfall × temperature
@@ -261,7 +274,7 @@ pip install --upgrade -r requirements.txt
 For questions about:
 - **Setup:** Check this README and requirements.txt
 - **Demo:** Follow DEMO_SCRIPT.md step-by-step
-- **Data format:** See sample_data.csv structure
+- **Data format:** See Input CSV Structure section in this README
 
 ---
 

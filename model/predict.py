@@ -16,7 +16,7 @@ from utils.risk_logic import classify_risk
 class OutbreakPredictor:
     """Load the persisted model and run inference on latest ward records."""
 
-    def __init__(self, model_path='model/outbreak_model.pkl'):
+    def __init__(self, model_path='model/final_outbreak_model_v3.pkl'):
         self.model = None
         self.feature_columns = None
         self.metrics = {}
@@ -43,31 +43,70 @@ class OutbreakPredictor:
         self.feature_columns = model_data.get('feature_columns', model_data.get('feature_list'))
         if self.feature_columns is None:
             raise ValueError('Model artifact missing feature_columns/feature_list')
+
         self.metrics = model_data.get('metrics', {})
-        self.best_threshold = model_data.get('best_threshold', self.metrics.get('best_threshold', THRESHOLD_FALLBACK))
+        global_threshold = model_data.get('global_threshold', self.metrics.get('global_threshold'))
+        if global_threshold is None:
+            raise ValueError('Model artifact missing required global_threshold')
+        self.best_threshold = model_data.get(
+            'best_threshold',
+            global_threshold,
+        )
+        if self.best_threshold is None:
+            raise ValueError('Model artifact missing required best_threshold/global_threshold')
         self.calibration = model_data.get('calibration', self.metrics.get('calibration', {'method': 'none'}))
-        self.model_metadata = {
-            'artifact_version': model_data.get('artifact_version', self.metrics.get('model_artifact_version', 'unknown')),
-            'trained_at_utc': model_data.get(
+
+        cv_metrics = model_data.get('cv_metrics', self.metrics.get('cv_metrics', {}))
+        training_data_range = model_data.get('training_data_range', self.metrics.get('training_data_range', {}))
+        trained_at = model_data.get(
+            'generated_at_utc',
+            model_data.get(
                 'trained_at_utc',
                 self.metrics.get('trained_at_utc', pd.Timestamp(os.path.getmtime(full_model_path), unit='s', tz='UTC').isoformat()),
             ),
-            'training_data_range': self.metrics.get('training_data_range', {}),
+        )
+        calibration_meta = self.metrics.get('calibration', {})
+        if not calibration_meta and isinstance(self.calibration, dict):
+            calibration_meta = {k: v for k, v in self.calibration.items() if k != 'calibrator'}
+
+        self.model_metadata = {
+            'artifact_version': model_data.get('artifact_version', self.metrics.get('model_artifact_version', 'unknown')),
+            'trained_at_utc': trained_at,
+            'training_data_range': training_data_range,
+            'training_range': training_data_range,
             'validation_metrics': self.metrics.get('validation_metrics', {}),
             'test_metrics': self.metrics.get('test_metrics', self.metrics),
             'best_threshold': self.best_threshold,
-            'calibration': self.metrics.get('calibration', {'method': 'none'}),
+            'threshold': float(global_threshold),
+            'calibration': calibration_meta if calibration_meta else {'method': 'none'},
             'leakage_checks': self.metrics.get('leakage_checks', {}),
             'outbreak_ratios': self.metrics.get('outbreak_ratios', {}),
             'distribution_shift': self.metrics.get('distribution_shift', {}),
-            'cv_metrics': self.metrics.get('cv_metrics', {}),
-            'n_folds': self.metrics.get('n_folds'),
-            'global_threshold': self.metrics.get('global_threshold', self.best_threshold),
+            'cv_metrics': cv_metrics,
+            'n_folds': self.metrics.get('n_folds', len(cv_metrics.get('fold_metrics', [])) if isinstance(cv_metrics, dict) else None),
+            'global_threshold': float(global_threshold if global_threshold is not None else self.best_threshold),
+            'n_samples': self.metrics.get('n_samples', model_data.get('n_samples', 'N/A')),
+            'n_features': self.metrics.get('n_features', len(self.feature_columns) if self.feature_columns is not None else 'N/A'),
+            'retraining_frequency_days': model_data.get('retraining_frequency_days', self.metrics.get('retraining_frequency_days')),
+            'best_params': model_data.get('best_params', self.metrics.get('best_params', {})),
+            'calibration_source': self.metrics.get('calibration_source', model_data.get('calibration', {}).get('fitted_on', 'N/A')),
         }
+
+        required_keys = [
+            'threshold',
+            'calibration',
+            'training_range',
+            'cv_metrics',
+            'artifact_version',
+        ]
+        for key in required_keys:
+            if key not in self.model_metadata:
+                raise RuntimeError(f"Artifact metadata missing required key: {key}")
+
         self.is_loaded = True
         return self.metrics
 
-    def load_latest_data(self, data_path='data/coimbatore_weekly_water_disease_2024.csv'):
+    def load_latest_data(self, data_path='data/integrated_surveillance_dataset_final.csv'):
         full_path = self._resolve_path(data_path)
         if not os.path.exists(full_path):
             raise FileNotFoundError(f"Data file not found: {full_path}")
@@ -112,7 +151,7 @@ class OutbreakPredictor:
 
         return probabilities
 
-    def predict_latest_week(self, df=None, data_path='data/coimbatore_weekly_water_disease_2024.csv', threshold_override=None):
+    def predict_latest_week(self, df=None, data_path='data/integrated_surveillance_dataset_final.csv', threshold_override=None):
         self._ensure_loaded()
         threshold = self.get_effective_threshold(threshold_override=threshold_override)
         source_df = df if df is not None else self.load_latest_data(data_path)
@@ -135,7 +174,7 @@ class OutbreakPredictor:
         result = result.sort_values('ward_id').reset_index(drop=True)
         return result
 
-    def predict_time_series(self, df=None, data_path='data/coimbatore_weekly_water_disease_2024.csv', threshold_override=None):
+    def predict_time_series(self, df=None, data_path='data/integrated_surveillance_dataset_final.csv', threshold_override=None):
         self._ensure_loaded()
         threshold = self.get_effective_threshold(threshold_override=threshold_override)
         source_df = df if df is not None else self.load_latest_data(data_path)
@@ -150,7 +189,7 @@ class OutbreakPredictor:
         result['risk'] = result['probability'].apply(lambda probability: classify_risk(probability, threshold=threshold))
         return result.sort_values(['ward_id', 'week_start_date']).reset_index(drop=True)
 
-    def predict_forward_projection(self, df=None, data_path='data/coimbatore_weekly_water_disease_2024.csv', horizon_weeks=2, threshold_override=None):
+    def predict_forward_projection(self, df=None, data_path='data/integrated_surveillance_dataset_final.csv', horizon_weeks=2, threshold_override=None):
         self._ensure_loaded()
         threshold = self.get_effective_threshold(threshold_override=threshold_override)
         source_df = (df if df is not None else self.load_latest_data(data_path)).copy()
