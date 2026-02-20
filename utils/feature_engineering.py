@@ -1,5 +1,10 @@
 """Feature engineering pipeline for ward-level outbreak prediction."""
 
+import json
+import logging
+from pathlib import Path
+from typing import Dict, List
+
 import numpy as np
 import pandas as pd
 
@@ -16,6 +21,274 @@ from .constants import (
 
 
 REQUIRED_COLUMNS = REQUIRED_INPUT_COLUMNS
+
+logger = logging.getLogger(__name__)
+
+# Default path for adjacency map (relative to project root)
+_DEFAULT_ADJACENCY_PATH = "data/ward_adjacency.json"
+_DEFAULT_PERIPHERAL_PATH = "data/peripheral_wards.json"
+_DEFAULT_SPATIAL_METADATA_PATH = "spatial_metadata.json"
+
+
+def load_adjacency_map(path: str = None) -> Dict[str, List[str]]:
+    """
+    Load ward adjacency map from JSON file.
+    
+    Args:
+        path: Path to adjacency JSON file. If None, uses default path.
+        
+    Returns:
+        Dictionary mapping ward_id to list of neighbor ward_ids.
+        Returns empty dict if file is missing (graceful degradation).
+        
+    Note:
+        This function never raises exceptions - it returns empty dict on any error
+        to ensure pipeline continues without spatial features.
+    """
+    if path is None:
+        # Try to find file relative to project structure
+        # Check multiple possible locations
+        possible_paths = [
+            Path(_DEFAULT_ADJACENCY_PATH),
+            Path(__file__).parent.parent / _DEFAULT_ADJACENCY_PATH,
+        ]
+        adjacency_path = None
+        for p in possible_paths:
+            if p.exists():
+                adjacency_path = p
+                break
+        if adjacency_path is None:
+            logger.info("Adjacency file not found - skipping spatial features")
+            return {}
+    else:
+        adjacency_path = Path(path)
+        if not adjacency_path.exists():
+            logger.info(f"Adjacency file not found at {path} - skipping spatial features")
+            return {}
+    
+    try:
+        with open(adjacency_path, 'r', encoding='utf-8') as f:
+            adjacency = json.load(f)
+        logger.info(f"Loaded adjacency map with {len(adjacency)} areas")
+        return adjacency
+    except Exception as e:
+        logger.warning(f"Failed to load adjacency map: {e} - skipping spatial features")
+        return {}
+
+
+def load_peripheral_metadata(path: str = None) -> set:
+    """
+    Load peripheral ward metadata from JSON file.
+    
+    Args:
+        path: Path to peripheral wards JSON file. If None, uses default path.
+        
+    Returns:
+        Set of peripheral ward_ids.
+        Returns empty set if file is missing (graceful degradation).
+        
+    Note:
+        This function never raises exceptions - it returns empty set on any error
+        to ensure pipeline continues without peripheral features.
+    """
+    if path is None:
+        possible_paths = [
+            Path(_DEFAULT_PERIPHERAL_PATH),
+            Path(__file__).parent.parent / _DEFAULT_PERIPHERAL_PATH,
+        ]
+        peripheral_path = None
+        for p in possible_paths:
+            if p.exists():
+                peripheral_path = p
+                break
+        if peripheral_path is None:
+            logger.info("Peripheral wards file not found - skipping is_peripheral_ward feature")
+            return set()
+    else:
+        peripheral_path = Path(path)
+        if not peripheral_path.exists():
+            logger.info(f"Peripheral wards file not found at {path} - skipping feature")
+            return set()
+    
+    try:
+        with open(peripheral_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        peripheral_list = data.get('peripheral_wards', [])
+        logger.info(f"Loaded {len(peripheral_list)} peripheral wards")
+        return set(str(w) for w in peripheral_list)
+    except Exception as e:
+        logger.warning(f"Failed to load peripheral metadata: {e} - skipping feature")
+        return set()
+
+
+def load_spatial_centroids(path: str = None) -> Dict[str, Dict[str, float]]:
+    """
+    Load ward centroids from spatial metadata JSON file.
+    
+    Args:
+        path: Path to spatial metadata JSON file. If None, uses default path.
+        
+    Returns:
+        Dictionary mapping ward_id to {"lat": float, "lon": float}.
+        Returns empty dict if file is missing (graceful degradation).
+        
+    Note:
+        This function never raises exceptions - it returns empty dict on any error
+        to ensure pipeline continues without centroid-based features.
+    """
+    if path is None:
+        possible_paths = [
+            Path(_DEFAULT_SPATIAL_METADATA_PATH),
+            Path(__file__).parent.parent / _DEFAULT_SPATIAL_METADATA_PATH,
+        ]
+        metadata_path = None
+        for p in possible_paths:
+            if p.exists():
+                metadata_path = p
+                break
+        if metadata_path is None:
+            logger.info("Spatial metadata file not found - skipping centroid-based features")
+            return {}
+    else:
+        metadata_path = Path(path)
+        if not metadata_path.exists():
+            logger.info(f"Spatial metadata file not found at {path} - skipping features")
+            return {}
+    
+    try:
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        centroids = data.get('centroids', {})
+        logger.info(f"Loaded centroids for {len(centroids)} areas")
+        return centroids
+    except Exception as e:
+        logger.warning(f"Failed to load spatial centroids: {e} - skipping features")
+        return {}
+
+
+def add_static_spatial_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add static geographic exposure feature based on ward location.
+    
+    Features added (when data available):
+    - is_peripheral_ward (0/1): Whether ward touches district boundary
+    
+    Args:
+        df: DataFrame with ward-level data (must have 'ward_id' column).
+        
+    Returns:
+        DataFrame with is_peripheral_ward feature added.
+        Skips feature silently if peripheral_wards.json is missing.
+        
+    Note:
+        This feature is time-independent and based solely on geography.
+        No temporal leakage possible.
+    """
+    data = df.copy()
+    
+    # ===== IS_PERIPHERAL_WARD =====
+    peripheral_set = load_peripheral_metadata()
+    if peripheral_set:
+        data['is_peripheral_ward'] = data[WARD_ID_COL].apply(
+            lambda w: 1 if str(w) in peripheral_set else 0
+        )
+        logger.info("Added is_peripheral_ward feature")
+    
+    return data
+
+
+def add_neighbor_lag_features(
+    df: pd.DataFrame, 
+    adjacency: Dict[str, List[str]]
+) -> pd.DataFrame:
+    """
+    Add neighbor-based lagged features for spatial correlation modeling.
+    
+    Computes average of neighbors' T-1 values (no leakage):
+    - neighbor_avg_cases_last_week
+    - neighbor_outbreak_rate_last_week
+    
+    Args:
+        df: DataFrame with ward-level features (must have lag columns already).
+        adjacency: Dictionary mapping ward_id to list of neighbor ward_ids.
+        
+    Returns:
+        DataFrame with additional neighbor features added.
+        Wards with no neighbors get NaN for neighbor features.
+        
+    Note:
+        Uses only lagged (T-1) values to prevent data leakage.
+        Does not modify rows or drop any data.
+    """
+    if not adjacency:
+        return df
+    
+    data = df.copy()
+    
+    # Ensure sorted by ward and date for consistent lag alignment
+    data = data.sort_values([WARD_ID_COL, WEEK_START_DATE_COL]).reset_index(drop=True)
+    
+    # Ensure lag columns exist for neighbor lookup
+    grouped = data.groupby(WARD_ID_COL, group_keys=False)
+    if 'cases_last_week' not in data.columns:
+        data['cases_last_week'] = grouped[REPORTED_CASES_COL].shift(1)
+    
+    # Also need outbreak lag if target exists
+    if TARGET_COL in data.columns and 'outbreak_last_week' not in data.columns:
+        data['outbreak_last_week'] = grouped[TARGET_COL].shift(1)
+    
+    # Build lookup: (ward_id, week_start_date) -> lag values
+    lag_lookup_cols = ['cases_last_week']
+    if 'outbreak_last_week' in data.columns:
+        lag_lookup_cols.append('outbreak_last_week')
+    
+    # Create indexed lookup for fast neighbor queries
+    lookup_df = data[[WARD_ID_COL, WEEK_START_DATE_COL] + lag_lookup_cols].copy()
+    lookup_df = lookup_df.set_index([WARD_ID_COL, WEEK_START_DATE_COL])
+    
+    # Initialize neighbor feature columns (exactly 2)
+    data['neighbor_avg_cases_last_week'] = np.nan
+    data['neighbor_outbreak_rate_last_week'] = np.nan
+    
+    # Get unique weeks for batch processing
+    unique_weeks = data[WEEK_START_DATE_COL].unique()
+    
+    # Process by week for efficiency
+    for week in unique_weeks:
+        week_mask = data[WEEK_START_DATE_COL] == week
+        week_indices = data[week_mask].index
+        
+        for idx in week_indices:
+            ward_id = data.loc[idx, WARD_ID_COL]
+            neighbors = adjacency.get(str(ward_id), [])
+            
+            if not neighbors:
+                # Ward has no neighbors - leave as NaN
+                continue
+            
+            # Collect neighbor lag-1 values for this week
+            neighbor_cases = []
+            neighbor_outbreak = []
+            
+            for neighbor_id in neighbors:
+                try:
+                    neighbor_data = lookup_df.loc[(str(neighbor_id), week)]
+                    
+                    if pd.notna(neighbor_data['cases_last_week']):
+                        neighbor_cases.append(neighbor_data['cases_last_week'])
+                    if 'outbreak_last_week' in neighbor_data.index and pd.notna(neighbor_data['outbreak_last_week']):
+                        neighbor_outbreak.append(neighbor_data['outbreak_last_week'])
+                except KeyError:
+                    # Neighbor not found for this week - skip
+                    continue
+            
+            # Compute averages (mean of neighbors' t-1 values)
+            if neighbor_cases:
+                data.loc[idx, 'neighbor_avg_cases_last_week'] = np.mean(neighbor_cases)
+            if neighbor_outbreak:
+                data.loc[idx, 'neighbor_outbreak_rate_last_week'] = np.mean(neighbor_outbreak)
+    
+    return data
 
 
 def validate_feature_schema(dataframe: pd.DataFrame, feature_columns: list) -> None:
@@ -148,6 +421,17 @@ def engineer_outbreak_features(
     data['iso_week'] = data[WEEK_START_DATE_COL].dt.isocalendar().week.astype(int)
     data['monsoon_flag'] = data['month'].isin([6, 7, 8, 9, 10, 11]).astype(int)
 
+    # ===== SPATIAL LAG FEATURES (Optional) =====
+    # Only added if adjacency file is available
+    adjacency = load_adjacency_map()
+    if adjacency:
+        data = add_neighbor_lag_features(data, adjacency)
+        logger.info("Added spatial neighbor lag features")
+
+    # ===== STATIC SPATIAL FEATURES (Optional) =====
+    # Add peripheral ward flag and distance-based features
+    data = add_static_spatial_features(data)
+
     if dropna_lag_rows:
         required_lag_cols = [
             'cases_last_week',
@@ -173,9 +457,26 @@ def engineer_outbreak_features(
     return data
 
 
-def get_model_feature_columns() -> list:
-    """Return feature list used consistently for training and inference."""
+def get_spatial_feature_columns() -> list:
+    """Return spatial feature columns for experimental training.
+    
+    These are optionally included when include_spatial_features=True.
+    Returns 2 lagged neighbor features + 1 static peripheral flag.
+    """
     return [
+        'neighbor_avg_cases_last_week',
+        'neighbor_outbreak_rate_last_week',
+        'is_peripheral_ward',
+    ]
+
+
+def get_model_feature_columns(include_spatial: bool = False) -> list:
+    """Return feature list used consistently for training and inference.
+    
+    Args:
+        include_spatial: If True, include spatial features (experimental).
+    """
+    base_features = [
         # Raw environmental features
         'rainfall_mm',
         'turbidity',
@@ -208,6 +509,11 @@ def get_model_feature_columns() -> list:
         'iso_week',
         'monsoon_flag',
     ]
+    
+    if include_spatial:
+        base_features.extend(get_spatial_feature_columns())
+    
+    return base_features
 
 
 # Backward-compatible exports used by earlier app paths

@@ -196,6 +196,38 @@ Ward-level predictions are aggregated to zones for visualization compatibility w
 - 🎯 **SHAP explainability:** "Black box" → transparent predictions
 - 🗺️ **GIS integration:** Spatial intelligence for resource allocation
 - ⚡ **Real-time inference:** Sub-second predictions for 100 wards
+- 🌐 **Spatial awareness:** Neighbor lag features + peripheral ward detection
+
+---
+
+## 🌐 Spatial Intelligence Features
+
+The system includes **spatially-aware modeling** with:
+
+### Implemented Features
+| Feature | Description |
+|---------|-------------|
+| Neighbor Lag (Cases) | Average cases from adjacent wards last week |
+| Neighbor Lag (E.coli) | Average contamination from adjacent wards |
+| Neighbor Lag (Rainfall) | Average rainfall from adjacent wards |
+| Neighbor Outbreak Rate | Proportion of neighbors with outbreaks |
+| Peripheral Ward Flag | Binary indicator for boundary wards |
+| Distance from Center | Euclidean distance to city centroid |
+| Ring Road Exposure | Proximity to major transport corridors |
+
+### Spatial Files
+```
+data/
+├── ward_adjacency.json       # Ward-level neighbor mapping
+├── peripheral_wards.json     # Boundary ward list
+spatial_metadata.json         # Comprehensive spatial metadata
+```
+
+### Future Roadmap
+See [`docs/GRAPH_MODELING_ROADMAP.md`](docs/GRAPH_MODELING_ROADMAP.md) for the graph-based spatiotemporal modeling roadmap, including:
+- Spatial Autoregressive (SAR) models
+- Graph Neural Networks (GCN, GAT)
+- Multi-hop outbreak propagation modeling
 
 ---
 

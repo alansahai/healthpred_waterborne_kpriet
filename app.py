@@ -31,6 +31,15 @@ from utils.constants import (
 )
 from utils.geo_mapping import aggregate_predictions_to_zones, map_ward_to_zone
 from utils.runtime_config import load_runtime_config
+from utils.spatial_viz import (
+    compute_peripheral_indicator,
+    compute_infection_influence_arrows,
+    compute_neighbor_risk_overlay,
+    get_spatial_viz_summary,
+    load_ward_centroids,
+    simulate_spatial_spread,
+    get_spread_simulation_summary,
+)
 
 
 # =============================================================================
@@ -88,12 +97,14 @@ def resolve_default_data_path():
 
 @st.cache_resource
 def load_predictor():
-    """Load trained model from artifact"""
+    """Load trained model from artifact (uses runtime config for model path)"""
     try:
-        model_path = 'model/final_outbreak_model_v3.pkl'
+        from utils.runtime_config import load_runtime_config
+        runtime_cfg = load_runtime_config()
+        model_path = runtime_cfg.get('model_path', 'model/final_outbreak_model_v3.pkl')
         full_model_path = os.path.join(os.path.dirname(__file__), model_path)
         if not os.path.exists(full_model_path):
-            raise RuntimeError("Frozen v3 artifact missing. Operational mode cannot start.")
+            raise RuntimeError(f"Model artifact missing: {model_path}")
         predictor = OutbreakPredictor(model_path=model_path)
         predictor.load_model()
         return predictor, None
@@ -578,8 +589,22 @@ def simulate_intervention(predictor, ward_data: pd.DataFrame, intervention: dict
         return {'error': str(e)}
 
 
-def create_heatmap_with_all_wards(predictions_df: pd.DataFrame, gdf: gpd.GeoDataFrame, threshold: float):
-    """Create risk heatmap ensuring all wards are rendered"""
+def create_heatmap_with_all_wards(
+    predictions_df: pd.DataFrame, 
+    gdf: gpd.GeoDataFrame, 
+    threshold: float,
+    show_influence_arrows: bool = False,
+    show_neighbor_overlay: bool = False
+):
+    """Create risk heatmap ensuring all wards are rendered.
+    
+    Args:
+        predictions_df: DataFrame with ward predictions
+        gdf: GeoDataFrame with zone geometries
+        threshold: Risk threshold
+        show_influence_arrows: If True, draw arrows from high-risk peripheral wards
+        show_neighbor_overlay: If True, add intensity overlay based on neighbor risk
+    """
     if gdf is None or len(gdf) == 0:
         return folium.Map(location=[11.0168, 76.9558], zoom_start=11)
 
@@ -597,6 +622,11 @@ def create_heatmap_with_all_wards(predictions_df: pd.DataFrame, gdf: gpd.GeoData
         zoom_start=11,
         tiles='OpenStreetMap'
     )
+
+    # Compute neighbor overlay if enabled (for border styling)
+    neighbor_overlay = {}
+    if show_neighbor_overlay:
+        neighbor_overlay = compute_neighbor_risk_overlay(predictions_df)
 
     # Merge predictions with geometry
     gdf_zones = gdf.copy()
@@ -632,6 +662,50 @@ def create_heatmap_with_all_wards(predictions_df: pd.DataFrame, gdf: gpd.GeoData
             },
             tooltip=folium.Tooltip(tooltip_text)
         ).add_to(m)
+
+    # Add influence arrows if enabled
+    if show_influence_arrows:
+        arrows = compute_infection_influence_arrows(predictions_df, threshold=threshold)
+        for arrow in arrows:
+            # Draw polyline arrow from high-risk peripheral ward to neighbor
+            folium.PolyLine(
+                locations=[arrow['from_coords'], arrow['to_coords']],
+                color='#FF4500',  # Orange-red for spillover
+                weight=2,
+                opacity=0.7,
+                dash_array='5, 5',  # Dashed line
+                tooltip=f"Spillover risk: {arrow['from_ward']} → {arrow['to_ward']} (P={arrow['influence']:.2f})"
+            ).add_to(m)
+            
+            # Add small circle at destination to indicate influence target
+            folium.CircleMarker(
+                location=arrow['to_coords'],
+                radius=4,
+                color='#FF4500',
+                fill=True,
+                fillOpacity=0.5,
+                tooltip=f"Influenced by {arrow['from_ward']}"
+            ).add_to(m)
+
+    # Add neighbor risk intensity markers if enabled
+    if show_neighbor_overlay and neighbor_overlay:
+        centroids = load_ward_centroids()
+        for ward_id, data in neighbor_overlay.items():
+            if data['high_risk_neighbor_count'] > 0 and ward_id in centroids:
+                coords = (centroids[ward_id]['lat'], centroids[ward_id]['lon'])
+                intensity = data['intensity']
+                
+                # Only show markers for wards with elevated neighbor risk
+                if intensity > 0.3:
+                    folium.CircleMarker(
+                        location=coords,
+                        radius=6 + (intensity * 8),  # Size based on intensity
+                        color='#8B0000',  # Dark red
+                        fill=True,
+                        fillColor='#FF6347',  # Tomato
+                        fillOpacity=intensity * 0.6,
+                        tooltip=f"{ward_id}: {data['high_risk_neighbor_count']} high-risk neighbors (avg: {data['neighbor_avg_risk']:.2f})"
+                    ).add_to(m)
 
     return m
 
@@ -957,7 +1031,7 @@ def page_operational_monitoring():
         alert_load = calculate_alert_load(predictions, threshold)
         icon, status_text = get_alert_status_color(alert_load)
 
-        col1, col2, col3 = st.columns([1, 2, 1])
+        col1, col2, col3, col4 = st.columns([1, 2, 1, 1])
         with col1:
             st.metric("Alert Status", icon)
         with col2:
@@ -969,6 +1043,17 @@ def page_operational_monitoring():
             )
         with col3:
             st.metric("Decision Threshold", f"{threshold:.3f}")
+        with col4:
+            # Compute % of high-risk wards that are peripheral (display-only)
+            high_risk_df = predictions[predictions['risk_class'] == 'High']
+            if 'is_peripheral_ward' in predictions.columns and len(high_risk_df) > 0:
+                peripheral_high = high_risk_df[high_risk_df['is_peripheral_ward'] == 1]
+                peripheral_pct = (len(peripheral_high) / len(high_risk_df)) * 100
+                st.metric("% High-Risk (Peripheral)", f"{peripheral_pct:.1f}%")
+            else:
+                st.metric("% High-Risk (Peripheral)", "N/A")
+        
+        st.caption("ℹ️ Model now incorporates neighbor spread risk.")
 
         # ===================================================================
         # ALERT LIST (RANKED BY PROBABILITY) WITH ACTION TRACKING
@@ -1162,21 +1247,202 @@ def page_operational_monitoring():
 
         st.markdown("---")
         st.markdown("### 🗺️ RISK HEATMAP - ALL WARDS")
+        
+        # Spatial visualization toggles
+        spatial_col1, spatial_col2, spatial_col3 = st.columns([1, 1, 2])
+        with spatial_col1:
+            show_influence_arrows = st.checkbox(
+                "🔗 Show Spillover Arrows", 
+                value=False,
+                help="Draw arrows from high-risk peripheral wards to their neighbors"
+            )
+        with spatial_col2:
+            show_neighbor_overlay = st.checkbox(
+                "🔥 Show Neighbor Risk", 
+                value=False,
+                help="Highlight wards surrounded by high-risk neighbors"
+            )
+        
+        # Peripheral risk indicator
+        with spatial_col3:
+            peripheral_indicator = compute_peripheral_indicator(predictions)
+            if peripheral_indicator and peripheral_indicator.get('available'):
+                if peripheral_indicator['high_risk_count'] > 0:
+                    st.metric(
+                        "Peripheral High-Risk Wards",
+                        f"{peripheral_indicator['percentage']:.0f}%",
+                        delta=f"{peripheral_indicator['peripheral_high_count']}/{peripheral_indicator['high_risk_count']} wards",
+                        delta_color="off"
+                    )
+                else:
+                    st.metric("Peripheral High-Risk Wards", "N/A", delta="No high-risk wards")
+        
+        # Simulation toggle (separate row)
+        sim_col1, sim_col2 = st.columns([1, 3])
+        with sim_col1:
+            enable_spread_simulation = st.checkbox(
+                "🧪 Enable Spread Simulation",
+                value=False,
+                help="Synthetic spatial diffusion simulation (visualization only, does not alter model predictions)"
+            )
+        
+        # Simulation parameters and execution
+        sim_df = None
+        sim_summary = None
+        if enable_spread_simulation:
+            with sim_col2:
+                sim_alpha = st.slider(
+                    "Diffusion coefficient (α)",
+                    min_value=0.10,
+                    max_value=0.15,
+                    value=0.12,
+                    step=0.01,
+                    help="Higher α = more spread influence from peripheral wards"
+                )
+            
+            # Run simulation
+            sim_df = simulate_spatial_spread(predictions, threshold=threshold, alpha=sim_alpha)
+            if sim_df is not None:
+                sim_summary = get_spread_simulation_summary(sim_df)
+            
+            # Display simulation banner
+            st.warning(
+                f"🧪 **SYNTHETIC SPATIAL DIFFUSION SIMULATION ENABLED** (α = {sim_alpha:.2f})  \n"
+                "This visualization shows hypothetical spread patterns. "
+                "**Core model predictions remain unchanged.**"
+            )
+        
         moderate_cutoff = float(threshold) * float(MODERATE_RISK_RATIO)
         st.markdown(
             f"**Legend:** 🟢 Low (<{moderate_cutoff:.3f}) | "
             f"🟡 Moderate ({moderate_cutoff:.3f}-{threshold:.3f}) | "
             f"🔴 High (≥{threshold:.3f}) | ⚪ No Data"
         )
+        
+        # Spatial overlay legend (if enabled)
+        if show_influence_arrows or show_neighbor_overlay:
+            legend_parts = []
+            if show_influence_arrows:
+                legend_parts.append("🟠 Dashed lines = spillover risk from peripheral wards")
+            if show_neighbor_overlay:
+                legend_parts.append("🔴 Circles = wards with high-risk neighbors (size = intensity)")
+            st.caption(" | ".join(legend_parts))
 
         try:
             gdf = gpd.read_file(os.path.join(os.path.dirname(__file__), 'geo', 'coimbatore.geojson'))
-            heatmap = create_heatmap_with_all_wards(predictions, gdf, threshold)
+            
+            # Use simulated data if simulation enabled, else use original predictions
+            if enable_spread_simulation and sim_df is not None:
+                # Create a view DataFrame for rendering with simulated probabilities
+                render_df = sim_df.copy()
+                render_df['probability'] = render_df['simulated_probability']
+                render_df['risk'] = render_df['simulated_risk']
+            else:
+                render_df = predictions
+            
+            heatmap = create_heatmap_with_all_wards(
+                render_df, 
+                gdf, 
+                threshold,
+                show_influence_arrows=show_influence_arrows,
+                show_neighbor_overlay=show_neighbor_overlay
+            )
             st_folium(heatmap, width=1400, height=600)
         except Exception as e:
             st.warning(f"⚠️ Could not render heatmap: {str(e)}")
         
         st.caption("📌 **How to read this map:** Display bands (green/yellow/red) show risk zones for interpretability. Decision threshold (⚫ black line) triggers alerts. Colors beyond threshold indicate zones requiring immediate attention.")
+
+        # ===================================================================
+        # SIMULATION RESULTS PANEL (when simulation enabled)
+        # ===================================================================
+        
+        if enable_spread_simulation and sim_summary and sim_summary.get('available'):
+            with st.expander("🧪 Simulation Results", expanded=True):
+                st.info(
+                    "📊 **Spatial spread shown here is SYNTHETIC SIMULATION for demonstration purposes only.** "
+                    "It does not alter core model predictions, thresholds, or risk classifications."
+                )
+                
+                sim_col1, sim_col2, sim_col3, sim_col4 = st.columns(4)
+                with sim_col1:
+                    st.metric("Affected Wards", sim_summary['affected_wards_count'])
+                with sim_col2:
+                    st.metric("New High-Risk (Simulated)", sim_summary['new_high_risk_count'])
+                with sim_col3:
+                    st.metric("Max Spread Delta", f"+{sim_summary['max_spread_delta']:.1%}")
+                with sim_col4:
+                    st.metric("Avg Spread Delta", f"+{sim_summary['avg_spread_delta']:.1%}")
+                
+                if sim_summary['spread_sources']:
+                    st.markdown(f"**Spread Sources:** {', '.join(sorted(sim_summary['spread_sources']))}")
+                
+                # Show comparison table
+                if sim_df is not None:
+                    affected = sim_df[sim_df['spread_delta'] > 0.001].sort_values('spread_delta', ascending=False)
+                    if len(affected) > 0:
+                        st.markdown("**Top Affected Wards:**")
+                        affected_display = affected[['ward_id', 'probability', 'simulated_probability', 'spread_delta', 'risk', 'simulated_risk']].head(10).copy()
+                        affected_display = affected_display.rename(columns={
+                            'ward_id': 'Ward',
+                            'probability': 'Original P',
+                            'simulated_probability': 'Simulated P',
+                            'spread_delta': 'Delta',
+                            'risk': 'Original Risk',
+                            'simulated_risk': 'Simulated Risk'
+                        })
+                        affected_display['Original P'] = affected_display['Original P'].apply(lambda x: f"{x:.1%}")
+                        affected_display['Simulated P'] = affected_display['Simulated P'].apply(lambda x: f"{x:.1%}")
+                        affected_display['Delta'] = affected_display['Delta'].apply(lambda x: f"+{x:.1%}")
+                        st.dataframe(affected_display, use_container_width=True, hide_index=True)
+
+        # ===================================================================
+        # SPATIAL SPREAD ANALYSIS (Optional Expander)
+        # ===================================================================
+        
+        if show_influence_arrows or show_neighbor_overlay:
+            with st.expander("📊 Spatial Spread Analysis Details", expanded=False):
+                spatial_summary = get_spatial_viz_summary(predictions)
+                
+                if spatial_summary['all_available']:
+                    col_sp1, col_sp2, col_sp3 = st.columns(3)
+                    
+                    # Peripheral indicator details
+                    if peripheral_indicator and peripheral_indicator.get('available'):
+                        with col_sp1:
+                            st.markdown("**Peripheral Ward Analysis**")
+                            st.write(f"• {peripheral_indicator['peripheral_high_count']} peripheral wards are high-risk")
+                            st.write(f"• {peripheral_indicator['high_risk_count']} total high-risk wards")
+                            st.write(f"• **{peripheral_indicator['percentage']:.1f}%** are on city boundary")
+                    
+                    # Influence arrows summary
+                    if show_influence_arrows:
+                        arrows = compute_infection_influence_arrows(predictions, threshold=threshold)
+                        with col_sp2:
+                            st.markdown("**Spillover Risk Connections**")
+                            if arrows:
+                                unique_sources = len(set(a['from_ward'] for a in arrows))
+                                unique_targets = len(set(a['to_ward'] for a in arrows))
+                                st.write(f"• {len(arrows)} spillover connections")
+                                st.write(f"• {unique_sources} source wards (high-risk peripheral)")
+                                st.write(f"• {unique_targets} potentially affected neighbors")
+                            else:
+                                st.write("No spillover connections detected")
+                    
+                    # Neighbor risk summary
+                    if show_neighbor_overlay:
+                        neighbor_data = compute_neighbor_risk_overlay(predictions)
+                        with col_sp3:
+                            st.markdown("**Neighbor Risk Clustering**")
+                            if neighbor_data:
+                                high_intensity = [w for w, d in neighbor_data.items() if d['intensity'] > 0.3]
+                                very_high = [w for w, d in neighbor_data.items() if d['high_risk_neighbor_count'] >= 3]
+                                st.write(f"• {len(high_intensity)} wards with elevated neighbor risk")
+                                st.write(f"• {len(very_high)} wards surrounded by 3+ high-risk neighbors")
+                            else:
+                                st.write("No neighbor clustering detected")
+                else:
+                    st.info("Spatial metadata not fully available. Some visualizations may be limited.")
 
 
         # ===================================================================
@@ -1356,6 +1622,15 @@ def page_admin():
 
     with col2:
         apply_noise = st.checkbox("Apply training noise", value=False)
+        include_spatial = st.checkbox("Include spatial features", value=True, 
+            help="Add neighbor lag + peripheral ward features (7 additional features)")
+
+    # Determine model path based on spatial features
+    if include_spatial:
+        model_output_path = 'artifacts/outbreak_model_spatial_v1.pkl'
+        st.info("🌐 Spatial model selected — will save to `artifacts/outbreak_model_spatial_v1.pkl`")
+    else:
+        model_output_path = 'model/final_outbreak_model_v3.pkl'
 
     if st.button("🚀 Retrain Model on Full Dataset", type="primary", use_container_width=True):
         st.info("🔄 Training started... This may take several minutes.")
@@ -1363,11 +1638,14 @@ def page_admin():
         try:
             from model.train import OutbreakModelTrainer
 
-            trainer = OutbreakModelTrainer(model_path='model/final_outbreak_model_v3.pkl')
+            trainer = OutbreakModelTrainer(
+                model_path=model_output_path,
+                include_spatial_features=include_spatial
+            )
             df = trainer.load_data(data_path)
             trainer.train(df, apply_realism_noise=apply_noise)
 
-            st.success("✅ Model trained successfully!")
+            st.success("✅ Model trained successfully!" + (" (with spatial features)" if include_spatial else ""))
             
             # Display results
             if hasattr(trainer, 'metrics'):

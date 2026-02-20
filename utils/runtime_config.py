@@ -7,6 +7,7 @@ from typing import Any, Dict
 DEFAULT_CONFIG: Dict[str, Any] = {
     "data_path": "data/integrated_surveillance_dataset_final.csv",
     "model_path": "model/final_outbreak_model_v3.pkl",
+    "include_spatial_features": False,
     "threshold_override": None,
     "retraining_frequency_days": 30,
     "forward_prediction_days": 7,

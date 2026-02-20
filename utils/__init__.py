@@ -6,6 +6,7 @@ from .feature_engineering import (
     prepare_outbreak_data,
     engineer_outbreak_features,
     get_model_feature_columns,
+    get_spatial_feature_columns,
     validate_feature_schema,
 )
 from .risk_logic import classify_risk, get_risk_color, generate_alerts, generate_alert_message, generate_alert_objects
@@ -19,6 +20,7 @@ __all__ = [
     'prepare_outbreak_data',
     'engineer_outbreak_features',
     'get_model_feature_columns',
+    'get_spatial_feature_columns',
     'validate_feature_schema',
     'REQUIRED_INPUT_COLUMNS',
     'classify_risk',

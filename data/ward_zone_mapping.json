@@ -1,0 +1,41 @@
+{
+  "zone_to_wards": {
+    "North Zone": ["W01", "W02", "W03", "W04", "W10", "W11", "W12", "W13", "W14", "W15", "W18", "W19", "W20", "W21", "W25", "W26", "W27", "W28", "W29", "W30"],
+    "East Zone": ["W05", "W06", "W07", "W08", "W09", "W22", "W23", "W24", "W50", "W51", "W52", "W53", "W54", "W55", "W56", "W57", "W58", "W59", "W60", "W61"],
+    "West Zone": ["W16", "W17", "W33", "W34", "W35", "W36", "W37", "W38", "W39", "W40", "W41", "W42", "W43", "W44", "W45", "W71", "W72", "W73", "W74", "W75"],
+    "Central Zone": ["W31", "W32", "W46", "W47", "W48", "W49", "W62", "W63", "W64", "W65", "W66", "W67", "W68", "W69", "W70", "W80", "W81", "W82", "W83", "W84"],
+    "South Zone": ["W76", "W77", "W78", "W79", "W85", "W86", "W87", "W88", "W89", "W90", "W91", "W92", "W93", "W94", "W95", "W96", "W97", "W98", "W99", "W100"]
+  },
+  "ward_to_zone": {
+    "W01": "North Zone", "W02": "North Zone", "W03": "North Zone", "W04": "North Zone",
+    "W10": "North Zone", "W11": "North Zone", "W12": "North Zone", "W13": "North Zone",
+    "W14": "North Zone", "W15": "North Zone", "W18": "North Zone", "W19": "North Zone",
+    "W20": "North Zone", "W21": "North Zone", "W25": "North Zone", "W26": "North Zone",
+    "W27": "North Zone", "W28": "North Zone", "W29": "North Zone", "W30": "North Zone",
+    "W05": "East Zone", "W06": "East Zone", "W07": "East Zone", "W08": "East Zone",
+    "W09": "East Zone", "W22": "East Zone", "W23": "East Zone", "W24": "East Zone",
+    "W50": "East Zone", "W51": "East Zone", "W52": "East Zone", "W53": "East Zone",
+    "W54": "East Zone", "W55": "East Zone", "W56": "East Zone", "W57": "East Zone",
+    "W58": "East Zone", "W59": "East Zone", "W60": "East Zone", "W61": "East Zone",
+    "W16": "West Zone", "W17": "West Zone", "W33": "West Zone", "W34": "West Zone",
+    "W35": "West Zone", "W36": "West Zone", "W37": "West Zone", "W38": "West Zone",
+    "W39": "West Zone", "W40": "West Zone", "W41": "West Zone", "W42": "West Zone",
+    "W43": "West Zone", "W44": "West Zone", "W45": "West Zone", "W71": "West Zone",
+    "W72": "West Zone", "W73": "West Zone", "W74": "West Zone", "W75": "West Zone",
+    "W31": "Central Zone", "W32": "Central Zone", "W46": "Central Zone", "W47": "Central Zone",
+    "W48": "Central Zone", "W49": "Central Zone", "W62": "Central Zone", "W63": "Central Zone",
+    "W64": "Central Zone", "W65": "Central Zone", "W66": "Central Zone", "W67": "Central Zone",
+    "W68": "Central Zone", "W69": "Central Zone", "W70": "Central Zone", "W80": "Central Zone",
+    "W81": "Central Zone", "W82": "Central Zone", "W83": "Central Zone", "W84": "Central Zone",
+    "W76": "South Zone", "W77": "South Zone", "W78": "South Zone", "W79": "South Zone",
+    "W85": "South Zone", "W86": "South Zone", "W87": "South Zone", "W88": "South Zone",
+    "W89": "South Zone", "W90": "South Zone", "W91": "South Zone", "W92": "South Zone",
+    "W93": "South Zone", "W94": "South Zone", "W95": "South Zone", "W96": "South Zone",
+    "W97": "South Zone", "W98": "South Zone", "W99": "South Zone", "W100": "South Zone"
+  },
+  "metadata": {
+    "total_wards": 100,
+    "wards_per_zone": 20,
+    "zones": ["North Zone", "East Zone", "West Zone", "Central Zone", "South Zone"]
+  }
+}

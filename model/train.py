@@ -22,6 +22,7 @@ from xgboost import XGBClassifier
 from utils.feature_engineering import (
     engineer_outbreak_features,
     get_model_feature_columns,
+    get_spatial_feature_columns,
     prepare_outbreak_data,
     validate_feature_schema,
 )
@@ -44,10 +45,11 @@ except ImportError:
 class OutbreakModelTrainer:
     """Train and evaluate an XGBoost classifier for outbreak_next_week."""
 
-    def __init__(self, model_path='model/outbreak_model.pkl'):
+    def __init__(self, model_path='model/outbreak_model.pkl', include_spatial_features=False):
         self.model = None
         self.model_path = model_path
-        self.feature_columns = get_model_feature_columns()
+        self.include_spatial_features = include_spatial_features
+        self.feature_columns = get_model_feature_columns(include_spatial=include_spatial_features)
         self.metrics = {}
         self.best_params = {}
         self.best_threshold = THRESHOLD_FALLBACK
@@ -406,11 +408,11 @@ class OutbreakModelTrainer:
         return float(np.mean(scores))
 
     def _build_feature_set_candidates(self):
-        full_features = get_model_feature_columns()
+        full_features = get_model_feature_columns(include_spatial=self.include_spatial_features)
         candidates = [
-            {'name': 'full_feature_set', 'columns': full_features},
+            {'name': 'full_feature_set' + ('_spatial' if self.include_spatial_features else ''), 'columns': full_features},
             {
-                'name': 'drop_interaction_feature',
+                'name': 'drop_interaction_feature' + ('_spatial' if self.include_spatial_features else ''),
                 'columns': [column for column in full_features if column != 'rainfall_ecoli_interaction'],
             },
         ]
@@ -544,6 +546,8 @@ class OutbreakModelTrainer:
             'n_samples': int(len(engineered)),
             'n_features': int(len(self.feature_columns)),
             'noise_applied': bool(apply_realism_noise),
+            'spatial_features_enabled': bool(self.include_spatial_features),
+            'spatial_feature_columns': get_spatial_feature_columns() if self.include_spatial_features else [],
             'class_balance': class_balance,
             'class_balance_assessment': class_balance_assessment,
             'leakage_checks': leakage_checks,

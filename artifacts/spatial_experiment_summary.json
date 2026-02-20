@@ -1,0 +1,60 @@
+{
+  "experiment": "spatial_features_v2",
+  "timestamp": "2026-02-21T01:46:25.801015",
+  "baseline": {
+    "model_path": "artifacts/outbreak_model_baseline.pkl",
+    "metrics": {
+      "accuracy": 0.5208,
+      "precision": 0.4062,
+      "recall": 0.8219,
+      "f1_score": 0.5179,
+      "roc_auc": 0.5121,
+      "n_features": 24,
+      "n_valid_folds": 5,
+      "selected_feature_set": "drop_interaction_feature",
+      "best_params": {
+        "max_depth": 6,
+        "learning_rate": 0.02,
+        "n_estimators": 400,
+        "min_child_weight": 4,
+        "reg_lambda": 2.5,
+        "subsample": 0.75,
+        "colsample_bytree": 0.75
+      }
+    },
+    "spatial_enabled": false
+  },
+  "spatial": {
+    "model_path": "artifacts/outbreak_model_spatial_experiment.pkl",
+    "metrics": {
+      "accuracy": 0.5695,
+      "precision": 0.4162,
+      "recall": 0.8187,
+      "f1_score": 0.5288,
+      "roc_auc": 0.5344,
+      "n_features": 27,
+      "n_valid_folds": 5,
+      "selected_feature_set": "drop_interaction_feature_spatial",
+      "best_params": {
+        "max_depth": 3,
+        "learning_rate": 0.08,
+        "n_estimators": 180,
+        "min_child_weight": 1,
+        "reg_lambda": 0.5,
+        "subsample": 0.95,
+        "colsample_bytree": 0.95
+      }
+    },
+    "spatial_enabled": true,
+    "spatial_features": [
+      "neighbor_avg_cases_last_week",
+      "neighbor_outbreak_rate_last_week",
+      "is_peripheral_ward"
+    ]
+  },
+  "comparison": {
+    "recall_delta": -0.0032,
+    "roc_auc_delta": 0.0223,
+    "f1_delta": 0.0109
+  }
+}
