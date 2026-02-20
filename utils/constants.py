@@ -1,0 +1,31 @@
+"""Shared constants for schema, split strategy, thresholding and analytics."""
+
+WEEK_START_DATE_COL = 'week_start_date'
+WARD_ID_COL = 'ward_id'
+RAINFALL_COL = 'rainfall_mm'
+TURBIDITY_COL = 'turbidity'
+ECOLI_COL = 'ecoli_index'
+REPORTED_CASES_COL = 'reported_cases'
+TARGET_COL = 'outbreak_next_week'
+
+REQUIRED_INPUT_COLUMNS = [
+    WEEK_START_DATE_COL,
+    WARD_ID_COL,
+    RAINFALL_COL,
+    TURBIDITY_COL,
+    ECOLI_COL,
+    REPORTED_CASES_COL,
+    TARGET_COL,
+]
+
+TRAIN_SPLIT_RATIO = 7 / 10
+VALIDATION_SPLIT_RATIO = 85 / 100
+
+THRESHOLD_FALLBACK = 1 / 2
+MODERATE_RISK_RATIO = 3 / 5
+
+SELECTION_RECALL_WEIGHT = 7 / 10
+SELECTION_F1_WEIGHT = 3 / 10
+
+SCATTER_POINT_OPACITY = 3 / 5
+INSIGHT_CORRELATION_CUTOFF = 3 / 10
